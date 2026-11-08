@@ -6506,6 +6506,7 @@ static struct {
 static void *vceRing1;
 static uint32_t vceProbeState;  // 0 not sent, 1 sent, 2 not possible
 static constexpr uint32_t VceProbeValue = 0xCAFE0001;
+static uint64_t vceProbeGart;  // the second probe fence, in ring 1's GART pages
 
 static bool gartRead(uint64_t addr, uint32_t *out, uint32_t bytes) {
 	auto *m = gpuMmio;
@@ -6578,6 +6579,34 @@ static void vceLiveTick() {
 				v == VceProbeValue ? "the firmware ran it" : "not written", r1, w1, m[0x8001]);
 		}
 	}
+	static uint32_t gartProbeLogs, gartProbeLast = 1;
+	if (vceProbeState == 1 && vceProbeGart && gartProbeLogs < 4) {
+		uint32_t v[2] {};
+		if (gartRead(vceProbeGart, v, sizeof(v)) && v[0] != gartProbeLast) {
+			gartProbeLast = v[0];
+			gartProbeLogs++;
+			diskLogEvent("vce probe: gart fence %llx now %x (%s)", vceProbeGart, v[0],
+				v[0] == VceProbeValue + 1 ? "written through the GART" : "not written");
+		}
+	}
+	// The session IB's feedback buffer (0x05000005, VA 4:00020000 in log 1747201272): where the firmware reports
+	// a task's status. Logged when it changes.
+	static uint32_t fbLogs, fbLast[16];
+	static uint64_t fbVa;
+	static uint32_t fbVmid;
+	if (fbVa && fbLogs < 6) {
+		uint32_t fb[16] {};
+		uint64_t phys = ibVaToPhys(fbVmid, fbVa);
+		if (phys && ibReadPhys(phys, sizeof(fb), fb, false) && memcmp(fb, fbLast, sizeof(fb))) {
+			memcpy(fbLast, fb, sizeof(fb));
+			fbLogs++;
+			char buf[200];
+			size_t len = 0;
+			for (size_t i = 0; i < arrsize(fb) && len + 12 < sizeof(buf); i++)
+				len += snprintf(buf + len, sizeof(buf) - len, " %x", fb[i]);
+			diskLogEvent("vce feedback %llx:%s", fbVa, buf);
+		}
+	}
 	if (fenceAddr && fenceLogs < 8) {
 		uint32_t v[2] {};
 		if (gartRead(fenceAddr, v, sizeof(v)) && (v[0] != fenceLast[0] || v[1] != fenceLast[1])) {
@@ -6614,7 +6643,7 @@ static void vceLiveTick() {
 		uint64_t va = static_cast<uint64_t>(ring[at + 3]) << 32 | ring[at + 2];
 		uint64_t fence = static_cast<uint64_t>(ring[at + 7]) << 32 | ring[at + 6];
 		uint64_t phys = ibVaToPhys(vmid, va);
-		uint32_t ib[32] {}, fenceVal[2] {0xFFFFFFFF, 0xFFFFFFFF};
+		uint32_t ib[96] {}, fenceVal[2] {0xFFFFFFFF, 0xFFFFFFFF};
 		bool ibOk = phys && ibReadPhys(phys, sizeof(ib), ib, false);
 		bool fenceOk = gartRead(fence, fenceVal, sizeof(fenceVal));
 		if (fenceOk && !fenceAddr) {
@@ -6627,11 +6656,25 @@ static void vceLiveTick() {
 			vmid < 8 ? m[0x54F + vmid] : m[0x50E + vmid - 8], va, phys, ibOk ? "" : " (unread)", fence, fenceVal[0],
 			fenceVal[1], fenceOk ? "" : " (unread)", m[0x536], m[0x53E]);
 		if (ibOk) {
-			char buf[400];
-			size_t len = 0;
-			for (size_t i = 0; i < arrsize(ib) && len + 12 < sizeof(buf); i++)
-				len += snprintf(buf + len, sizeof(buf) - len, " %x", ib[i]);
-			diskLogEvent("vce ib:%s", buf);
+			uint32_t dw = ring[at + 4] < arrsize(ib) ? ring[at + 4] : static_cast<uint32_t>(arrsize(ib));
+			for (uint32_t part = 0; part < dw; part += 32) {
+				char buf[400];
+				size_t len = 0;
+				for (uint32_t i = part; i < dw && i < part + 32 && len + 12 < sizeof(buf); i++)
+					len += snprintf(buf + len, sizeof(buf) - len, " %x", ib[i]);
+				diskLogEvent("vce ib +%u:%s", part, buf);
+			}
+			// The feedback buffer: the IB's 0x05000005 packet (size, id, address hi, lo, ...).
+			for (uint32_t i = 0; i + 3 < dw;) {
+				uint32_t len = ib[i];
+				if (len < 8 || len % 4 || i + len / 4 > dw)
+					break;
+				if (ib[i + 1] == 0x05000005 && !fbVa) {
+					fbVa = static_cast<uint64_t>(ib[i + 2]) << 32 | ib[i + 3];
+					fbVmid = vmid;
+				}
+				i += len / 4;
+			}
 		}
 	}
 }
@@ -6761,7 +6804,13 @@ static void vceFenceProbe() {
 	*reinterpret_cast<volatile uint32_t *>(target) = 0;
 	uint64_t mc = smuLoad.mc + Smu8::VcePdOffset;
 	uint32_t *p = ring + tail;
-	uint32_t cmd[0x20] {3, static_cast<uint32_t>(mc), static_cast<uint32_t>(mc >> 32), VceProbeValue, 1};
+	// Second fence: system memory through the GART (Apple's fence is at 0x20000280), into ring 1's own last dwords,
+	// which nothing uses while its tail stays near the start.
+	uint64_t ringMc = static_cast<uint64_t>(m[0x8061]) << 32 | m[0x8060];
+	vceProbeGart = ringMc + (static_cast<uint64_t>(size) - 4) * 4;
+	ring[size - 4] = 0;
+	uint32_t cmd[0x20] {3, static_cast<uint32_t>(mc), static_cast<uint32_t>(mc >> 32), VceProbeValue, 3,
+		static_cast<uint32_t>(vceProbeGart), static_cast<uint32_t>(vceProbeGart >> 32), VceProbeValue + 1, 1};
 	memcpy(p, cmd, sizeof(cmd));
 	__asm__ volatile("sfence" ::: "memory");
 	tail += 0x20;
@@ -6773,7 +6822,8 @@ static void vceFenceProbe() {
 	uint32_t rptr = m[0x8063];
 	m[0xC200] = 0xE0000000;
 	vceProbeState = 1;
-	diskLogEvent("vce probe: FENCE %x -> mc %llx on ring 1, wptr %x (rptr %x)", VceProbeValue, mc, tail, rptr);
+	diskLogEvent("vce probe: FENCE %x -> mc %llx, FENCE %x -> gart %llx on ring 1, wptr %x (rptr %x)", VceProbeValue, mc,
+		VceProbeValue + 1, vceProbeGart, tail, rptr);
 }
 
 static void vcePrependPtb(void *that) {
