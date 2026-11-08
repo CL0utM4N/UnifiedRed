@@ -1581,6 +1581,8 @@ static uint64_t ibMcToPhys(uint64_t addr, bool system);
 static uint64_t ibVaToPhys(uint32_t vmid, uint64_t va);
 static bool ibReadPhys(uint64_t phys, uint32_t bytes, void *out, bool coherent);
 static uint8_t *carvePtr(uint64_t phys, uint32_t bytes);
+static uint8_t *physmapPtr(uint64_t phys, uint32_t bytes);
+static void flushLines(const uint8_t *p, uint32_t bytes);
 static bool physRangeOk(uint64_t phys, uint32_t bytes);
 static mach_vm_address_t orgAddPlistPropertiesToPCIDevice;
 static uint64_t wrapAddPlistPropertiesToPCIDevice(IOService *that, const char *name);
@@ -6864,6 +6866,39 @@ static void vceFenceProbe() {
 		VceProbeValue + 1, vceProbeGart, tail, rptr);
 }
 
+// Is it Apple's IB, or VCE's access through VMID 7? (log 1747203593, 70044fc: Linux's create-session IB ran from our
+// VRAM with VMID 0.) With -crvceswapib, overwrite Apple's first IB in place, through its VMID 7 mapping, with that
+// same Linux create message (feedback 0x400 bytes on, in the same page), and fix the block's IB length; Apple's block
+// then goes out as before. A fence means VMID 7 works and Apple's IB contents are the problem. It ends Apple's session.
+static uint32_t vceSwaps;
+
+static void vceSwapIb(uint32_t vmid, uint64_t va, uint32_t *ibCmd) {
+	if (vceSwaps || !checkKernelArgument("-crvceswapib") || (va & 0xFFF) + 0x500 > 0x1000)
+		return;
+	vceSwaps++;
+	uint64_t phys = ibVaToPhys(vmid, va);
+	auto *p = phys ? physmapPtr(phys, 0x500) : nullptr;
+	if (!p) {
+		diskLogEvent("vce swap: IB va %llx not mapped (phys %llx)", va, phys);
+		return;
+	}
+	uint64_t fbVa = va + 0x400;
+	static const uint32_t create[] {0xc, 1, 1, 0x40, 0x01000001, 0, 0x42, 0xa, 1, 0x80, 0x60, 0x100, 0x100, 0xc, 0, 0, 0,
+		0, 0};
+	auto *ib = reinterpret_cast<uint32_t *>(p);
+	memset(p, 0, 0x500);
+	memcpy(ib, create, sizeof(create));
+	uint32_t dw = arrsize(create);
+	ib[dw++] = 0x14;
+	ib[dw++] = 0x05000005;
+	ib[dw++] = static_cast<uint32_t>(fbVa >> 32);
+	ib[dw++] = static_cast<uint32_t>(fbVa);
+	ib[dw++] = 1;
+	flushLines(p, 0x500);
+	ibCmd[4] = dw;
+	diskLogEvent("vce swap: Apple's IB at va %llx (phys %llx) now Linux's create message, %u dwords", va, phys, dw);
+}
+
 static void vcePrependPtb(void *that) {
 	static int off = -1;
 	if (off < 0)
@@ -6897,6 +6932,7 @@ static void vcePrependPtb(void *that) {
 				memcpy(blk + 6, copy, used * 4);
 				for (uint32_t i = used + 6; i < 0x20; i++)
 					blk[i] = 0;
+				vceSwapIb(vmid, static_cast<uint64_t>(blk[6 + 3]) << 32 | blk[6 + 2], blk + 6);
 				if (vcePtbRewrites++ < 8)
 					diskLogEvent("vce ptb: block at %x: vmid %u page directory %x (%u dwords before, VM_CONTEXT cntl %x)",
 						pos, vmid, pd, used, m[0x504 + (vmid ? 1 : 0)]);
