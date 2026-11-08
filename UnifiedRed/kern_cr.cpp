@@ -6502,6 +6502,10 @@ static struct {
 	uint32_t tails, heads, logged, regs[arrsize(vceRegs)], ring[2][24];
 	bool ringRead[2];
 } vceLive;
+// The ring 1 fence probe (vceFenceProbe).
+static void *vceRing1;
+static uint32_t vceProbeState;  // 0 not sent, 1 sent, 2 not possible
+static constexpr uint32_t VceProbeValue = 0xCAFE0001;
 
 static bool gartRead(uint64_t addr, uint32_t *out, uint32_t bytes) {
 	auto *m = gpuMmio;
@@ -6560,6 +6564,20 @@ static void vceLiveTick() {
 	static const size_t bases[2][2] {{14, 15}, {9, 10}};
 	static uint32_t ringLogs, ibLogs, fenceLogs, fenceLast[2];
 	static uint64_t fenceAddr;
+	static uint32_t probeLogs, probeLast = 1;
+	if (vceProbeState == 1 && probeLogs < 6) {
+		auto *t = carvePtr(smuLoad.phys + Smu8::VcePdOffset, 8);
+		uint32_t v = t ? *reinterpret_cast<volatile uint32_t *>(t) : 0xFFFFFFFF;
+		if (v != probeLast) {
+			probeLast = v;
+			probeLogs++;
+			m[0xC200] = 7;
+			uint32_t r1 = m[0x8063], w1 = m[0x8064];
+			m[0xC200] = 0xE0000000;
+			diskLogEvent("vce probe: fence dword now %x (%s); ring 1 rptr %x wptr %x, VCE_STATUS %x", v,
+				v == VceProbeValue ? "the firmware ran it" : "not written", r1, w1, m[0x8001]);
+		}
+	}
 	if (fenceAddr && fenceLogs < 8) {
 		uint32_t v[2] {};
 		if (gartRead(fenceAddr, v, sizeof(v)) && (v[0] != fenceLast[0] || v[1] != fenceLast[1])) {
@@ -6643,6 +6661,8 @@ static void vceRingLog(const char *what, void *that, uint32_t kind, uint64_t ret
 
 static bool wrapRingEnable(void *that) {
 	auto kind = vceRingKind(that);
+	if (kind == 1)
+		vceRing1 = that;
 	bool ret = FunctionCast(wrapRingEnable, orgRingEnable)(that);
 	if (kind)
 		vceRingLog("enable", that, kind, ret);
@@ -6672,13 +6692,16 @@ static uint32_t vcePtbRewrites, vcePtbSkips;
 // 0x400000 (VA 16 GB; the IB is at 4:00000300) where Linux's starts at 0, the only layout the firmware's own walk has
 // met. If it indexes the directory by the VA alone, it reads entry 64 for Apple's entry 0. So hand it a shadow
 // directory in our VRAM region (Smu8::VcePdOffset): (start >> entry shift) empty entries, then a copy of Apple's
-// entries, which keep pointing at Apple's page tables. Refreshed on every submit. -crnovceshadow gives it Apple's.
+// entries, which keep pointing at Apple's page tables. Refreshed on every submit.
+// Disproved (log 1747199769, efa72c3): UPDATE_PTB makes the firmware write VM_CONTEXTn_PAGE_TABLE_BASE_ADDR itself
+// (VMID 7's base read back as the shadow), so VCE uses the memory controller's VM, which handles the start address;
+// and the shadow then replaced the base the graphics side uses for that VMID. Only with -crvceshadow now.
 static uint32_t vceShadowBuilds, vceShadowFails;
 
 static uint32_t vceShadowPd(uint32_t applePd) {
 	static int off = -1;
 	if (off < 0)
-		off = checkKernelArgument("-crnovceshadow") ? 1 : 0;
+		off = checkKernelArgument("-crvceshadow") ? 0 : 1;
 	auto *m = gpuMmio;
 	if (off || !m || !smuLoad.mc || !smuLoad.phys)
 		return applePd;
@@ -6707,6 +6730,50 @@ static uint32_t vceShadowPd(uint32_t applePd) {
 		diskLogEvent("vce shadow: %llu empty + %llu entries (shift %u) at mc %llx for pd %x; entry 0 %llx", skip, entries,
 			shift, smuLoad.mc + Smu8::VcePdOffset, applePd, *reinterpret_cast<uint64_t *>(src));
 	return shadow;
+}
+
+// Does the firmware run commands at all? (log 1747199769: it consumes the LLQ block, VCE_STATUS cycles 2 / 22 =
+// VCPU_REPORT 1 / 0x11 with JOB_BUSY and UENC_BUSY clear, no fence.) Before Apple's first LLQ submit, put a lone
+// VCE_CMD_FENCE (VMID 0, to a dword of our VRAM region, value 0xCAFE0001) and VCE_CMD_END on ring 1, which Apple leaves
+// idle, at its tail, moving Apple's tail and submitted marks with it, and bump its write pointer under the instance
+// select. The watcher reads the dword back. -crnovceprobe leaves ring 1 alone.
+
+static void vceFenceProbe() {
+	auto *m = gpuMmio;
+	if (vceProbeState || !m || !smuLoad.mc || checkKernelArgument("-crnovceprobe"))
+		return;
+	auto *b = static_cast<uint8_t *>(vceRing1);
+	auto *target = carvePtr(smuLoad.phys + Smu8::VcePdOffset, 8);
+	if (!b || !target) {
+		vceProbeState = 2;
+		return;
+	}
+	auto *ring = *reinterpret_cast<uint32_t **>(b + 0x40);
+	auto &size = *reinterpret_cast<uint32_t *>(b + 0x30);
+	auto &tail = *reinterpret_cast<uint32_t *>(b + 0x54);
+	auto &submitted = *reinterpret_cast<uint32_t *>(b + 0x74);
+	if (!ring || !size || size > 0x100000 || tail != submitted || tail + 0x20 > size || !b[0x70]) {
+		vceProbeState = 2;
+		diskLogEvent("vce probe: ring 1 not usable (enabled %u tail %x submitted %x size %x)", b[0x70], tail, submitted,
+			size);
+		return;
+	}
+	*reinterpret_cast<volatile uint32_t *>(target) = 0;
+	uint64_t mc = smuLoad.mc + Smu8::VcePdOffset;
+	uint32_t *p = ring + tail;
+	uint32_t cmd[0x20] {3, static_cast<uint32_t>(mc), static_cast<uint32_t>(mc >> 32), VceProbeValue, 1};
+	memcpy(p, cmd, sizeof(cmd));
+	__asm__ volatile("sfence" ::: "memory");
+	tail += 0x20;
+	if (tail >= size)
+		tail = 0;
+	submitted = tail;
+	m[0xC200] = 7;
+	m[0x8064] = tail;
+	uint32_t rptr = m[0x8063];
+	m[0xC200] = 0xE0000000;
+	vceProbeState = 1;
+	diskLogEvent("vce probe: FENCE %x -> mc %llx on ring 1, wptr %x (rptr %x)", VceProbeValue, mc, tail, rptr);
 }
 
 static void vcePrependPtb(void *that) {
@@ -6757,6 +6824,8 @@ static void vcePrependPtb(void *that) {
 
 static void wrapRingSubmit(void *that) {
 	auto kind = vceRingKind(that);
+	if (kind == 2)
+		vceFenceProbe();
 	if (kind) {
 		vcePrependPtb(that);
 		vceRingLog("submit (before)", that, kind, 0);
