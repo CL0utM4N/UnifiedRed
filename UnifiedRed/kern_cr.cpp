@@ -6579,6 +6579,19 @@ static void vceLiveTick() {
 				v == VceProbeValue ? "the firmware ran it" : "not written", r1, w1, m[0x8001]);
 		}
 	}
+	static uint32_t ibProbeLogs, ibProbeLast = 1;
+	if (vceProbeState == 1 && ibProbeLogs < 4) {
+		auto *r = carvePtr(smuLoad.phys + Smu8::VcePdOffset, 0x3000);
+		uint32_t v = r ? *reinterpret_cast<volatile uint32_t *>(r + 0x100) : 0xFFFFFFFF;
+		if (r && v != ibProbeLast) {
+			ibProbeLast = v;
+			ibProbeLogs++;
+			auto *fb = reinterpret_cast<volatile uint32_t *>(r + 0x2000);
+			diskLogEvent("vce probe: Linux create-session IB fence now %x (%s); feedback %x %x %x %x %x %x %x %x", v,
+				v == VceProbeValue + 2 ? "the session ran" : "not written", fb[0], fb[1], fb[2], fb[3], fb[4], fb[5],
+				fb[6], fb[7]);
+		}
+	}
 	static uint32_t gartProbeLogs, gartProbeLast = 1;
 	if (vceProbeState == 1 && vceProbeGart && gartProbeLogs < 4) {
 		uint32_t v[2] {};
@@ -6803,6 +6816,30 @@ static void vceFenceProbe() {
 	}
 	*reinterpret_cast<volatile uint32_t *>(target) = 0;
 	uint64_t mc = smuLoad.mc + Smu8::VcePdOffset;
+	// Then Linux's VCE IB test (amdgpu_vce_get_create_msg for firmware >= 52: session, create 128x96, feedback), the
+	// case known to work on Stoney: IB_VM with VMID 0 and memory-controller addresses, from our region (IB at +0x1000,
+	// feedback at +0x2000), then a third fence (+0x100). If it lands, the encoder runs sessions and Apple's job is what
+	// fails; if not, the encoding engine itself doesn't run.
+	auto *region = carvePtr(smuLoad.phys + Smu8::VcePdOffset, 0x3000);
+	if (!region || tail + 0x40 > size) {
+		vceProbeState = 2;
+		return;
+	}
+	auto *ibMem = reinterpret_cast<uint32_t *>(region + 0x1000);
+	uint64_t ibMc = mc + 0x1000, fbMc = mc + 0x2000;
+	static const uint32_t create[] {0xc, 1, 1, 0x40, 0x01000001, 0, 0x42, 0xa, 1, 0x80, 0x60, 0x100, 0x100, 0xc, 0, 0, 0,
+		0, 0};
+	memset(region + 0x1000, 0, 0x2000);
+	memcpy(ibMem, create, sizeof(create));
+	uint32_t ibDw = arrsize(create);
+	ibMem[ibDw++] = 0x14;
+	ibMem[ibDw++] = 0x05000005;
+	ibMem[ibDw++] = static_cast<uint32_t>(fbMc >> 32);
+	ibMem[ibDw++] = static_cast<uint32_t>(fbMc);
+	ibMem[ibDw++] = 1;
+	*reinterpret_cast<volatile uint32_t *>(region + 0x100) = 0;
+	uint32_t test[0x20] {0x102, 0, static_cast<uint32_t>(ibMc), static_cast<uint32_t>(ibMc >> 32), ibDw, 3,
+		static_cast<uint32_t>(mc + 0x100), static_cast<uint32_t>((mc + 0x100) >> 32), VceProbeValue + 2, 1};
 	uint32_t *p = ring + tail;
 	// Second fence: system memory through the GART (Apple's fence is at 0x20000280), into ring 1's own last dwords,
 	// which nothing uses while its tail stays near the start.
@@ -6812,8 +6849,9 @@ static void vceFenceProbe() {
 	uint32_t cmd[0x20] {3, static_cast<uint32_t>(mc), static_cast<uint32_t>(mc >> 32), VceProbeValue, 3,
 		static_cast<uint32_t>(vceProbeGart), static_cast<uint32_t>(vceProbeGart >> 32), VceProbeValue + 1, 1};
 	memcpy(p, cmd, sizeof(cmd));
+	memcpy(p + 0x20, test, sizeof(test));
 	__asm__ volatile("sfence" ::: "memory");
-	tail += 0x20;
+	tail += 0x40;
 	if (tail >= size)
 		tail = 0;
 	submitted = tail;
