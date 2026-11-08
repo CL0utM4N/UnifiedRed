@@ -1580,6 +1580,7 @@ static void vceLiveTick();
 static uint64_t ibMcToPhys(uint64_t addr, bool system);
 static uint64_t ibVaToPhys(uint32_t vmid, uint64_t va);
 static bool ibReadPhys(uint64_t phys, uint32_t bytes, void *out, bool coherent);
+static uint8_t *carvePtr(uint64_t phys, uint32_t bytes);
 static bool physRangeOk(uint64_t phys, uint32_t bytes);
 static mach_vm_address_t orgAddPlistPropertiesToPCIDevice;
 static uint64_t wrapAddPlistPropertiesToPCIDevice(IOService *that, const char *name);
@@ -5759,9 +5760,10 @@ namespace Smu8 {
 	static constexpr uint32_t JobListEntries = 32;                                     // NUM_JOBLIST_ENTRIES
 	static constexpr uint16_t EndOfTaskList = 0xFFFF;
 	// Region layout: TOC, the scratch buffers (Linux smu_buffer), then the images, 4 KB aligned; then the IH ring and its
-	// write-back word (see moveIhRing).
+	// write-back word (see moveIhRing); then VCE's shadow page directory (see vcePrependPtb).
 	static constexpr uint32_t TocOffset = 0, ScratchOffset = 0x1000, UcodeOffset = 0x5000, IhOffset = 0x60000,
-	                          IhMaxSize = 0x40000, RegionSize = IhOffset + IhMaxSize + 0x1000;
+	                          IhMaxSize = 0x40000, VcePdOffset = IhOffset + IhMaxSize + 0x1000, VcePdSize = 0x4000,
+	                          RegionSize = VcePdOffset + VcePdSize;
 	struct Task {  // SMU_Task
 		uint8_t type, arg;
 		uint16_t next;
@@ -6665,6 +6667,48 @@ static void wrapRingDisable(void *that) {
 // base, +0x30 size in dwords, +0x54 tail, +0x74 last submitted tail (dwords). -crnovceptb leaves the blocks alone.
 static uint32_t vcePtbRewrites, vcePtbSkips;
 
+// The page directory the firmware gets (log 1747198949, 2a4fc73): with UPDATE_PTB the firmware consumed the block, but
+// the fence was never written and no VM fault was raised. Apple's VM starts at VM_CONTEXT1_PAGE_TABLE_START_ADDR
+// 0x400000 (VA 16 GB; the IB is at 4:00000300) where Linux's starts at 0, the only layout the firmware's own walk has
+// met. If it indexes the directory by the VA alone, it reads entry 64 for Apple's entry 0. So hand it a shadow
+// directory in our VRAM region (Smu8::VcePdOffset): (start >> entry shift) empty entries, then a copy of Apple's
+// entries, which keep pointing at Apple's page tables. Refreshed on every submit. -crnovceshadow gives it Apple's.
+static uint32_t vceShadowBuilds, vceShadowFails;
+
+static uint32_t vceShadowPd(uint32_t applePd) {
+	static int off = -1;
+	if (off < 0)
+		off = checkKernelArgument("-crnovceshadow") ? 1 : 0;
+	auto *m = gpuMmio;
+	if (off || !m || !smuLoad.mc || !smuLoad.phys)
+		return applePd;
+	uint32_t cntl = m[0x505], start = m[0x558], end = m[0x560];
+	uint32_t shift = 12 + 9 + ((cntl >> 24) & 0xF);  // VA bits per directory entry (two-level tables)
+	uint64_t startVa = static_cast<uint64_t>(start) << 12, span = (static_cast<uint64_t>(end) - start + 1) << 12;
+	uint64_t skip = startVa >> shift, entries = span >> shift;
+	if (((cntl >> 1) & 3) != 1 || (startVa & ((1ULL << shift) - 1)) || !entries ||
+		(skip + entries) * 8 > Smu8::VcePdSize) {
+		if (vceShadowFails++ < 4)
+			diskLogEvent("vce shadow: layout not handled (cntl %x start %x end %x)", cntl, start, end);
+		return applePd;
+	}
+	uint64_t applePhys = ibMcToPhys(static_cast<uint64_t>(applePd) << 12, false);
+	auto *src = carvePtr(applePhys, static_cast<uint32_t>(entries * 8));
+	auto *dst = carvePtr(smuLoad.phys + Smu8::VcePdOffset, Smu8::VcePdSize);
+	if (!src || !dst) {
+		if (vceShadowFails++ < 4)
+			diskLogEvent("vce shadow: no mapping (apple pd phys %llx)", applePhys);
+		return applePd;
+	}
+	memset(dst, 0, static_cast<size_t>(skip * 8));
+	memcpy(dst + skip * 8, src, static_cast<size_t>(entries * 8));
+	uint32_t shadow = static_cast<uint32_t>((smuLoad.mc + Smu8::VcePdOffset) >> 12);
+	if (vceShadowBuilds++ < 4)
+		diskLogEvent("vce shadow: %llu empty + %llu entries (shift %u) at mc %llx for pd %x; entry 0 %llx", skip, entries,
+			shift, smuLoad.mc + Smu8::VcePdOffset, applePd, *reinterpret_cast<uint64_t *>(src));
+	return shadow;
+}
+
 static void vcePrependPtb(void *that) {
 	static int off = -1;
 	if (off < 0)
@@ -6688,6 +6732,8 @@ static void vcePrependPtb(void *that) {
 				used--;
 			uint32_t vmid = blk[1];
 			uint32_t pd = vmid < 8 ? m[0x54F + vmid] : m[0x50E + vmid - 8];
+			if (pd)
+				pd = vceShadowPd(pd);
 			if (used + 6 <= 0x20 && pd) {
 				uint32_t copy[0x20];
 				memcpy(copy, blk, used * 4);
