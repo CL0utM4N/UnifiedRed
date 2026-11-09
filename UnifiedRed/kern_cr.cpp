@@ -1579,6 +1579,7 @@ static void uvdLiveTick();
 static void vceLiveTick();
 static uint64_t ibMcToPhys(uint64_t addr, bool system);
 static uint64_t ibVaToPhys(uint32_t vmid, uint64_t va);
+static uint64_t vmWalkInfo(uint32_t vmid, uint64_t va, uint32_t *flags, uint64_t *pde0);
 static bool ibReadPhys(uint64_t phys, uint32_t bytes, void *out, bool coherent);
 static uint8_t *carvePtr(uint64_t phys, uint32_t bytes);
 static uint8_t *physmapPtr(uint64_t phys, uint32_t bytes);
@@ -6510,6 +6511,8 @@ static uint32_t vceProbeState;  // 0 not sent, 1 sent, 2 not possible
 static constexpr uint32_t VceProbeValue = 0xCAFE0001;
 static uint64_t vceProbeGart;  // the second probe fence, in ring 1's GART pages
 static uint32_t vceRing1Vm7State;  // the swap's VMID 7 copy on ring 1: 0 not sent, 1 sent, 2 failed
+static uint32_t vceOwnVmid;  // the probe's own-page-table VMID (base register restored by the watcher), 0 none
+static uint64_t vceOwnMs;
 
 static bool gartRead(uint64_t addr, uint32_t *out, uint32_t bytes) {
 	auto *m = gpuMmio;
@@ -6533,6 +6536,20 @@ static bool gartRead(uint64_t addr, uint32_t *out, uint32_t bytes) {
 	if (!readPhys(carveout + table + ((addr - start) >> 12) * 8, sizeof(pte), &pte) || !(pte & 1))
 		return false;
 	return readPhys((pte & 0xFFFFFFFFF000ULL) | (addr & 0xFFF), bytes, out);
+}
+
+// The GART (VM context 0) page table entry for a GART address, as the hardware reads it (table in the carve-out).
+static uint64_t gartPte(uint64_t addr) {
+	auto *m = gpuMmio;
+	uint64_t table = static_cast<uint64_t>(m[0x54F]) << 12, start = static_cast<uint64_t>(m[0x557]) << 12;
+	uint64_t carveout = static_cast<uint64_t>(m[Reg::MC_VM_FB_OFFSET] & 0x3FFFF) << 22;
+	uint64_t phys = carveout + table + ((addr - start) >> 12) * 8, pte = 0;
+	if (!table || !start || addr < start)
+		return 0;
+	auto *p = carvePtr(phys, 8);
+	if (p)
+		memcpy(&pte, p, 8);
+	return pte;
 }
 
 static void vceSnapshot(const char *why) {
@@ -6615,6 +6632,35 @@ static void vceLiveTick() {
 				(st1 >> 25) & 0xF, m[0x53F], static_cast<uint64_t>(m[0x53F]) << 12, c1, ch(c1, 0), ch(c1, 1), ch(c1, 2),
 				ch(c1, 3));
 		}
+	}
+	static uint32_t ownProbeLogs, ownProbeLast = 1;
+	if (vceOwnVmid && ownProbeLogs < 4) {
+		auto *r = carvePtr(smuLoad.phys + Smu8::VcePdOffset, 0x3000);
+		uint32_t v = r ? *reinterpret_cast<volatile uint32_t *>(r + 0x10C) : 0xFFFFFFFF;
+		if (r && v != ownProbeLast) {
+			ownProbeLast = v;
+			ownProbeLogs++;
+			diskLogEvent("vce probe: own page table (vmid %u, Apple's layout, GART pte) fence now %x (%s); base reg %x",
+				vceOwnVmid, v, v == VceProbeValue + 5 ? "VCE VMIDs work: Apple's VMID 7 tables differ" : "not written",
+				m[0x50E + vceOwnVmid - 8]);
+		}
+	}
+	// Put the borrowed VMID's base back (UPDATE_PTB wrote it), 2 s on.
+	if (vceOwnVmid && vceOwnMs && uptimeMs() > vceOwnMs + 2000) {
+		m[0x50E + vceOwnVmid - 8] = 0;
+		vceOwnMs = 0;
+	}
+	// Apple's VMID 7 PTE for its IB page next to the GART PTE VCE reads fine: flags (bits 11:0) and address.
+	static bool pteLogged;
+	if (!pteLogged && vceProbeState == 1 && vceRing1Vm7State) {
+		pteLogged = true;
+		uint32_t flags = 0;
+		uint64_t pde = 0;
+		uint64_t ibVa = (static_cast<uint64_t>(m[0x558]) << 12) + 0x300;  // Apple's first IB: VM start + 0x300
+		uint64_t phys = vmWalkInfo(7, ibVa, &flags, &pde);
+		uint64_t ring1 = static_cast<uint64_t>(s.regs[15]) << 32 | s.regs[14];
+		diskLogEvent("vce pte: vmid 7 va %llx -> phys %llx flags %x (PDE0 %llx); GART probe pte %llx", ibVa, phys, flags,
+			pde, gartPte(ring1 + 0x10000));
 	}
 	static uint32_t vm7ProbeLogs, vm7ProbeLast = 1;
 	if (vceRing1Vm7State == 1 && vm7ProbeLogs < 4) {
@@ -6866,8 +6912,8 @@ static void vceFenceProbe() {
 	// case known to work on Stoney: IB_VM with VMID 0 and memory-controller addresses, from our region (IB at +0x1000,
 	// feedback at +0x2000), then a third fence (+0x100). If it lands, the encoder runs sessions and Apple's job is what
 	// fails; if not, the encoding engine itself doesn't run.
-	auto *region = carvePtr(smuLoad.phys + Smu8::VcePdOffset, 0x3000);
-	if (!region || tail + 0x60 > size || size < 0x1000) {
+	auto *region = carvePtr(smuLoad.phys + Smu8::VcePdOffset, 0x4000);
+	if (!region || tail + 0x80 > size || size < 0x1000) {
 		vceProbeState = 2;
 		return;
 	}
@@ -6915,12 +6961,56 @@ static void vceFenceProbe() {
 	*reinterpret_cast<volatile uint32_t *>(region + 0x104) = 0;
 	uint32_t sysTest[0x20] {0x102, 0, static_cast<uint32_t>(sysIb), static_cast<uint32_t>(sysIb >> 32), sysDw, 3,
 		static_cast<uint32_t>(mc + 0x104), static_cast<uint32_t>((mc + 0x104) >> 32), VceProbeValue + 3, 1};
+	// Fourth: our own page table in a free VMID (43931af log 1747215214: VMID 7 gives no fence and no VM fault in
+	// either context). Apple's layout (the shared VM_CONTEXT1_CNTL depth/block size and start), one page in our region
+	// serving as both directory and table: PDE 0 points back at the page, PTE 1 is a copy of the GART entry of the
+	// system memory page the VMID 0 test above runs from. So VA start + 0x1000 + x = that page + x. The same create
+	// message (handle 5) at +0x800 in that page, feedback +0xC00, fence 0xCAFE0006 to our region +0x10C. Fences: VCE's
+	// VMIDs work and Apple's VMID 7 tables are what differ (compare the PTE flags logged); no fence: VCE can't use any
+	// VMID but 0 here, and its jobs have to be moved to VMID 0. Firmware's UPDATE_PTB writes that VMID's base register;
+	// the watcher puts it back after.
+	uint32_t ownCmd[0x20] {};
+	uint32_t depth = (m[0x505] >> 1) & 3;
+	uint64_t sysPte = gartPte(sysIb);
+	vceOwnVmid = 0;
+	for (uint32_t v = 15; v >= 8 && !vceOwnVmid; v--)
+		if (!m[0x50E + v - 8])
+			vceOwnVmid = v;
+	if (depth == 1 && (sysPte & 1) && vceOwnVmid) {
+		auto *tbl = reinterpret_cast<uint64_t *>(region + 0x3000);
+		uint64_t tblMc = mc + 0x3000;
+		memset(tbl, 0, 0x1000);
+		tbl[0] = tblMc | 1;
+		tbl[1] = sysPte;
+		uint64_t ownVa = (static_cast<uint64_t>(m[0x558]) << 12) + 0x1000 + 0x800, ownFb = ownVa + 0x400;
+		uint32_t *own = sysMem + 0x200;
+		memset(own, 0, 0x800);
+		memcpy(own, create, sizeof(create));
+		own[2] = 5;
+		uint32_t ownDw = arrsize(create);
+		own[ownDw++] = 0x14;
+		own[ownDw++] = 0x05000005;
+		own[ownDw++] = static_cast<uint32_t>(ownFb >> 32);
+		own[ownDw++] = static_cast<uint32_t>(ownFb);
+		own[ownDw++] = 1;
+		flushLines(reinterpret_cast<const uint8_t *>(own), 0x800);
+		*reinterpret_cast<volatile uint32_t *>(region + 0x10C) = 0;
+		uint32_t v = vceOwnVmid, pd = static_cast<uint32_t>(tblMc >> 12);
+		uint32_t c[] {0x107, v, pd, 0x108, v, 1, 0x102, v, static_cast<uint32_t>(ownVa), static_cast<uint32_t>(ownVa >> 32),
+			ownDw, 3, static_cast<uint32_t>(mc + 0x10C), static_cast<uint32_t>((mc + 0x10C) >> 32), VceProbeValue + 5, 1};
+		memcpy(ownCmd, c, sizeof(c));
+		vceOwnMs = uptimeMs();
+	} else {
+		vceOwnVmid = 0;
+		ownCmd[0] = 1;  // END
+	}
 	memcpy(p, cmd, sizeof(cmd));
 	memcpy(p + 0x20, test, sizeof(test));
 	memcpy(p + 0x40, sysTest, sizeof(sysTest));
-	flushLines(reinterpret_cast<const uint8_t *>(p), 0x60 * 4);
+	memcpy(p + 0x60, ownCmd, sizeof(ownCmd));
+	flushLines(reinterpret_cast<const uint8_t *>(p), 0x80 * 4);
 	__asm__ volatile("sfence" ::: "memory");
-	tail += 0x60;
+	tail += 0x80;
 	if (tail >= size)
 		tail = 0;
 	submitted = tail;
@@ -6930,7 +7020,8 @@ static void vceFenceProbe() {
 	m[0xC200] = 0xE0000000;
 	vceProbeState = 1;
 	diskLogEvent("vce probe: FENCE %x -> mc %llx, FENCE %x -> gart %llx on ring 1, wptr %x (rptr %x); sysmem IB at gart "
-		"%llx", VceProbeValue, mc, VceProbeValue + 1, vceProbeGart, tail, rptr, sysIb);
+		"%llx (pte %llx); own table: vmid %u depth %u", VceProbeValue, mc, VceProbeValue + 1, vceProbeGart, tail, rptr,
+		sysIb, sysPte, vceOwnVmid, depth);
 }
 
 // Is it Apple's IB, or VCE's access through VMID 7? (log 1747203593, 70044fc: Linux's create-session IB ran from our
@@ -10107,6 +10198,17 @@ static uint64_t ibVaToPhysWalk(uint32_t vmid, uint64_t va, VmCacheEntry *slot, u
 
 static uint64_t ibVaToPhys(uint32_t vmid, uint64_t va) {
 	return ibVaToPhysWalk(vmid, va, nullptr);
+}
+
+// For the VCE log: the walk's PTE flags, and the VMID's first directory entry.
+static uint64_t vmWalkInfo(uint32_t vmid, uint64_t va, uint32_t *flags, uint64_t *pde0) {
+	auto *mmio = gpuMmio;
+	if (!mmio || !vmid || vmid > 15)
+		return 0;
+	uint64_t pdb = static_cast<uint64_t>(vmid < 8 ? mmio[0x550 + vmid - 1] : mmio[0x50E + vmid - 8]) << 12;
+	if (pde0 && !ibReadPhys(ibMcToPhys(pdb, false), 8, pde0, false))
+		*pde0 = 0;
+	return ibVaToPhysWalk(vmid, va, nullptr, flags);
 }
 
 // Only with interpLock held.
