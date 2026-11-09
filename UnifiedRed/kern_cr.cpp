@@ -6594,6 +6594,17 @@ static void vceLiveTick() {
 				fb[6], fb[7]);
 		}
 	}
+	static uint32_t sysProbeLogs, sysProbeLast = 1;
+	if (vceProbeState == 1 && sysProbeLogs < 4) {
+		auto *r = carvePtr(smuLoad.phys + Smu8::VcePdOffset, 0x3000);
+		uint32_t v = r ? *reinterpret_cast<volatile uint32_t *>(r + 0x104) : 0xFFFFFFFF;
+		if (r && v != sysProbeLast) {
+			sysProbeLast = v;
+			sysProbeLogs++;
+			diskLogEvent("vce probe: sysmem create IB (VMID 0, GART) fence now %x (%s)", v,
+				v == VceProbeValue + 3 ? "VCE reads system memory: VMID 7 is the problem" : "not written");
+		}
+	}
 	static uint32_t gartProbeLogs, gartProbeLast = 1;
 	if (vceProbeState == 1 && vceProbeGart && gartProbeLogs < 4) {
 		uint32_t v[2] {};
@@ -6823,7 +6834,7 @@ static void vceFenceProbe() {
 	// feedback at +0x2000), then a third fence (+0x100). If it lands, the encoder runs sessions and Apple's job is what
 	// fails; if not, the encoding engine itself doesn't run.
 	auto *region = carvePtr(smuLoad.phys + Smu8::VcePdOffset, 0x3000);
-	if (!region || tail + 0x40 > size) {
+	if (!region || tail + 0x60 > size || size < 0x1000) {
 		vceProbeState = 2;
 		return;
 	}
@@ -6850,10 +6861,33 @@ static void vceFenceProbe() {
 	ring[size - 4] = 0;
 	uint32_t cmd[0x20] {3, static_cast<uint32_t>(mc), static_cast<uint32_t>(mc >> 32), VceProbeValue, 3,
 		static_cast<uint32_t>(vceProbeGart), static_cast<uint32_t>(vceProbeGart >> 32), VceProbeValue + 1, 1};
+	// Third: VMID 7 or system memory? (2244ebf log 1747210313: the swap under VMID 7 still gave no fence.) The same
+	// create message (session handle 3: the one above has 1, the swap 2, so none is a second create of a live
+	// session) from system memory under VMID 0: IB in ring 1's GART pages halfway in (unused), feedback 0x400 bytes on,
+	// fence 0xCAFE0004 to our region +0x104. Lands: system memory is fine and VMID 7 is the problem; doesn't: VCE
+	// can't read system memory (snooped pages) at all.
+	uint32_t half = size / 2;
+	uint64_t sysIb = ringMc + static_cast<uint64_t>(half) * 4, sysFb = sysIb + 0x400;
+	uint32_t *sysMem = ring + half;
+	memset(sysMem, 0, 0x500);
+	memcpy(sysMem, create, sizeof(create));
+	sysMem[2] = 3;
+	uint32_t sysDw = arrsize(create);
+	sysMem[sysDw++] = 0x14;
+	sysMem[sysDw++] = 0x05000005;
+	sysMem[sysDw++] = static_cast<uint32_t>(sysFb >> 32);
+	sysMem[sysDw++] = static_cast<uint32_t>(sysFb);
+	sysMem[sysDw++] = 1;
+	flushLines(reinterpret_cast<const uint8_t *>(sysMem), 0x500);
+	*reinterpret_cast<volatile uint32_t *>(region + 0x104) = 0;
+	uint32_t sysTest[0x20] {0x102, 0, static_cast<uint32_t>(sysIb), static_cast<uint32_t>(sysIb >> 32), sysDw, 3,
+		static_cast<uint32_t>(mc + 0x104), static_cast<uint32_t>((mc + 0x104) >> 32), VceProbeValue + 3, 1};
 	memcpy(p, cmd, sizeof(cmd));
 	memcpy(p + 0x20, test, sizeof(test));
+	memcpy(p + 0x40, sysTest, sizeof(sysTest));
+	flushLines(reinterpret_cast<const uint8_t *>(p), 0x60 * 4);
 	__asm__ volatile("sfence" ::: "memory");
-	tail += 0x40;
+	tail += 0x60;
 	if (tail >= size)
 		tail = 0;
 	submitted = tail;
@@ -6862,8 +6896,8 @@ static void vceFenceProbe() {
 	uint32_t rptr = m[0x8063];
 	m[0xC200] = 0xE0000000;
 	vceProbeState = 1;
-	diskLogEvent("vce probe: FENCE %x -> mc %llx, FENCE %x -> gart %llx on ring 1, wptr %x (rptr %x)", VceProbeValue, mc,
-		VceProbeValue + 1, vceProbeGart, tail, rptr);
+	diskLogEvent("vce probe: FENCE %x -> mc %llx, FENCE %x -> gart %llx on ring 1, wptr %x (rptr %x); sysmem IB at gart "
+		"%llx", VceProbeValue, mc, VceProbeValue + 1, vceProbeGart, tail, rptr, sysIb);
 }
 
 // Is it Apple's IB, or VCE's access through VMID 7? (log 1747203593, 70044fc: Linux's create-session IB ran from our
@@ -6888,6 +6922,7 @@ static void vceSwapIb(uint32_t vmid, uint64_t va, uint32_t *ibCmd) {
 	auto *ib = reinterpret_cast<uint32_t *>(p);
 	memset(p, 0, 0x500);
 	memcpy(ib, create, sizeof(create));
+	ib[2] = 2;  // session handle 2: the probe's create (1) already made session 1
 	uint32_t dw = arrsize(create);
 	ib[dw++] = 0x14;
 	ib[dw++] = 0x05000005;
