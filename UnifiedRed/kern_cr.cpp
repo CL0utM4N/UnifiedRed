@@ -7104,11 +7104,19 @@ static const char *sclkDpmState() {
 	return smuDpm.resp[0] == 1 ? "on" : "failed";
 }
 
+// After a wake the video power-up was never redone (log 1747206161: idle sleep, then every VCE context refused as
+// unpowered). AMDHardware::powerUpHWEngines runs smuVideoPowerOn on entry, while smuVideo.done is still set from boot,
+// and only then does its PM4 power-up reach this load, find the SMU's power lost and clear smuVideo.done. So power
+// video up here, after a reload that followed a power loss: still before Apple powers UVD and VCE (later slots in the
+// same powerUpHWEngines loop), as at boot.
 static uint64_t wrapStoneyLoadRlcUcode(void *cail) {
+	uint32_t lossesBefore = smuPowerLosses;
 	smuLoadFirmware(cail);
 	auto ret = FunctionCast(wrapStoneyLoadRlcUcode, orgStoneyLoadRlcUcode)(cail);
 	if (smuLoad.result)
 		smuStep(7);  // CAIL has started the RLC, now with real microcode
+	if (smuPowerLosses != lossesBefore && smuLoadOk() && checkKernelArgument("-crvideo"))
+		smuVideoPowerOn();
 	return ret;
 }
 
