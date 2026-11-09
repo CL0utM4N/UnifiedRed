@@ -1580,6 +1580,7 @@ static void vceLiveTick();
 static uint64_t ibMcToPhys(uint64_t addr, bool system);
 static uint64_t ibVaToPhys(uint32_t vmid, uint64_t va);
 static uint64_t vmWalkInfo(uint32_t vmid, uint64_t va, uint32_t *flags, uint64_t *pde0);
+static bool vceBridgeBlock(uint32_t *blk);
 static bool ibReadPhys(uint64_t phys, uint32_t bytes, void *out, bool coherent);
 static uint8_t *carvePtr(uint64_t phys, uint32_t bytes);
 static uint8_t *physmapPtr(uint64_t phys, uint32_t bytes);
@@ -7130,7 +7131,9 @@ static void vcePrependPtb(void *that) {
 		if (pos + 0x20 > size)
 			break;
 		uint32_t *blk = ring + pos;
-		if (blk[0] == 0x102 && blk[5] == 3 && blk[1] < 16) {
+		if (blk[0] == 0x102 && blk[5] == 3 && blk[1] && blk[1] < 16 && vceBridgeBlock(blk)) {
+			// moved to VMID 0: no page directory update needed
+		} else if (blk[0] == 0x102 && blk[5] == 3 && blk[1] < 16) {
 			uint32_t used = 0x20;
 			while (used && !blk[used - 1])
 				used--;
@@ -10198,6 +10201,268 @@ static uint64_t ibVaToPhysWalk(uint32_t vmid, uint64_t va, VmCacheEntry *slot, u
 
 static uint64_t ibVaToPhys(uint32_t vmid, uint64_t va) {
 	return ibVaToPhysWalk(vmid, va, nullptr);
+}
+
+// VCE VMID 0 bridge. VCE here doesn't finish a job under any VMID but 0 (logs 1747212945-1747216893: Linux's create
+// message fences from VRAM and from system memory through the GART under VMID 0, but neither under Apple's VMID 7
+// tables nor under our own one-page table in VMID 15, on either ring, and nothing latches a VM fault). Linux ran VCE
+// without VM before Stoney (vce_v3_0_ring_phys_funcs): amdgpu_vce_ring_parse_cs rewrites each buffer address in the
+// IB to a GPU address the engine reaches directly (amdgpu_vce_cs_reloc). Do the same with Apple's jobs: a window of
+// GART entries (the unused run at the end of the GART table) takes copies of Apple's VMID 7 PTEs for the IB and each
+// buffer the IB names, the addresses in the IB are rewritten to the window, and the ring block's IB_VM goes to VMID 0
+// with the IB's window address. Mappings are kept and reused while Apple's PTEs for them stay the same.
+// -crnovcebridge keeps Apple's VMID 7 path.
+static uint64_t vmPteRaw(uint32_t vmid, uint64_t va) {
+	auto *mmio = gpuMmio;
+	if (!mmio || !vmid || vmid > 15)
+		return 0;
+	uint32_t cntl = mmio[0x505], start = mmio[0x558], end = mmio[0x560];
+	uint64_t page = va >> 12;
+	if (page < start || page > end)
+		return 0;
+	uint32_t depth = (cntl >> 1) & 3, block = (cntl >> 24) & 0xF;
+	uint64_t pdb = static_cast<uint64_t>(vmid < 8 ? mmio[0x54F + vmid] : mmio[0x50E + vmid - 8]) << 12;
+	uint64_t pfn = page - start, entry = 0;
+	if (depth == 0) {
+		if (!ibReadPhys(ibMcToPhys(pdb, false) + pfn * 8, 8, &entry))
+			return 0;
+	} else {
+		uint32_t bits = 9 + block;
+		uint64_t pde = 0;
+		if (!ibReadPhys(ibMcToPhys(pdb, false) + (pfn >> bits) * 8, 8, &pde) || !(pde & 1))
+			return 0;
+		if (!ibReadPhys(ibMcToPhys(pde & 0xFFFFFFFFF000ULL, pde & 2) + (pfn & ((1ULL << bits) - 1)) * 8, 8, &entry))
+			return 0;
+	}
+	return (entry & 1) ? entry : 0;
+}
+
+static struct {
+	bool tried, ok, dirty;
+	uint64_t windowVa;  // GART address of slot 0
+	uint64_t *pte;      // slot 0's GART entry (carve-out, uncached)
+	uint32_t slots, next, entries, tailRun;
+	uint64_t tailValue;
+	uint32_t blocks, maps, pages, reuses, mapFails, relocs, unknownCmds, lastUnknown, badLen;
+} vceBridge;
+
+static struct {
+	uint32_t vmid, slot, pages;
+	uint64_t va, pte0, pteN;
+} vceBridgeMaps[48];
+static uint32_t vceBridgeMapNext;
+
+static bool vceBridgeInit() {
+	auto &b = vceBridge;
+	if (b.tried)
+		return b.ok;
+	b.tried = true;
+	auto *m = gpuMmio;
+	uint64_t table = static_cast<uint64_t>(m[0x54F]) << 12, start = static_cast<uint64_t>(m[0x557]),
+			 end = static_cast<uint64_t>(m[0x55F]);
+	if (!table || !start || end <= start || end - start > 0x100000) {
+		diskLogEvent("vce bridge: GART not usable (table %llx start %llx end %llx)", table, start, end);
+		return false;
+	}
+	b.entries = static_cast<uint32_t>(end - start + 1);
+	auto *ptes = reinterpret_cast<volatile uint64_t *>(carvePtr(ibMcToPhys(table, false), b.entries * 8));
+	if (!ptes) {
+		diskLogEvent("vce bridge: GART table %llx (%u entries) not mapped", table, b.entries);
+		return false;
+	}
+	// The run at the end equal to the last entry: unused entries are either invalid or all point at one dummy page.
+	b.tailValue = ptes[b.entries - 1];
+	uint32_t run = 0;
+	while (run < b.entries && run < 0x10000 && ptes[b.entries - 1 - run] == b.tailValue)
+		run++;
+	b.tailRun = run;
+	constexpr uint32_t Margin = 64, MaxSlots = 0x4000, MinSlots = 0x800;
+	uint32_t slots = run > Margin ? run - Margin : 0;
+	if (slots > MaxSlots)
+		slots = MaxSlots;
+	uint32_t first = b.entries - Margin - slots;
+	diskLogEvent("vce bridge: GART %llx-%llx (%u entries, table %llx), tail run %u of %llx; entries before it: %llx %llx",
+		start << 12, (end << 12) | 0xFFF, b.entries, table, run, b.tailValue,
+		run < b.entries ? static_cast<uint64_t>(ptes[b.entries - 1 - run]) : 0,
+		run + 1 < b.entries ? static_cast<uint64_t>(ptes[b.entries - 2 - run]) : 0);
+	if (slots < MinSlots || ((b.tailValue & 1) && run < 0x1000)) {
+		diskLogEvent("vce bridge: off, only %u free GART entries", slots);
+		return false;
+	}
+	b.slots = slots;
+	b.windowVa = (start + first) << 12;
+	b.pte = const_cast<uint64_t *>(ptes) + first;
+	b.ok = true;
+	diskLogEvent("vce bridge: window %u entries at GART %llx", slots, b.windowVa);
+	return true;
+}
+
+// The window address for va, with [va, va + bytes) mapped as far as Apple's VMID tables have it (to the first
+// unmapped page); 0 if va itself isn't mapped.
+static uint64_t vceBridgeMap(uint32_t vmid, uint64_t va, uint64_t bytes) {
+	auto &b = vceBridge;
+	uint64_t pageVa = va & ~0xFFFULL;
+	uint32_t pages = static_cast<uint32_t>((((va & 0xFFF) + bytes + 0xFFF) >> 12));
+	if (!pages)
+		pages = 1;
+	if (pages > b.slots)
+		pages = b.slots;
+	for (auto &e : vceBridgeMaps) {
+		if (!e.pages || e.vmid != vmid || pageVa < e.va || pageVa >= e.va + (static_cast<uint64_t>(e.pages) << 12))
+			continue;
+		uint64_t off = (pageVa - e.va) >> 12;
+		bool fits = off + pages <= e.pages;
+		if (fits && vmPteRaw(vmid, e.va) == e.pte0 &&
+			vmPteRaw(vmid, e.va + ((static_cast<uint64_t>(e.pages) - 1) << 12)) == e.pteN) {
+			b.reuses++;
+			return b.windowVa + (static_cast<uint64_t>(e.slot) << 12) + (va - e.va);
+		}
+		e.pages = 0;  // changed or too short: map afresh
+	}
+	if (b.next + pages > b.slots)
+		b.next = 0;
+	uint32_t slot = b.next, done = 0;
+	uint64_t first = 0, last = 0;
+	for (; done < pages; done++) {
+		uint64_t e = vmPteRaw(vmid, pageVa + (static_cast<uint64_t>(done) << 12));
+		if (!e)
+			break;
+		if (!done)
+			first = e;
+		last = e;
+		b.pte[slot + done] = e & ~0xF80ULL;  // fragment bits off: the window isn't aligned like Apple's VA
+	}
+	if (!done) {
+		b.mapFails++;
+		return 0;
+	}
+	// Mappings whose slots this one took are gone.
+	for (auto &e : vceBridgeMaps)
+		if (e.pages && e.slot < slot + done && slot < e.slot + e.pages)
+			e.pages = 0;
+	auto &n = vceBridgeMaps[vceBridgeMapNext++ % arrsize(vceBridgeMaps)];
+	n = {vmid, slot, done, pageVa, first, last};
+	b.next = slot + done;
+	b.maps++;
+	b.pages += done;
+	b.dirty = true;
+	return b.windowVa + (static_cast<uint64_t>(slot) << 12) + (va & 0xFFF);
+}
+
+// One dword of the IB, through Apple's tables (the last page is remembered).
+static volatile uint32_t *vceIbDword(uint32_t vmid, uint64_t va) {
+	static uint64_t lastPage = ~0ULL;
+	static uint32_t lastVmid;
+	static uint8_t *lastPtr;
+	uint64_t page = va & ~0xFFFULL;
+	if (page != lastPage || vmid != lastVmid) {
+		uint64_t phys = ibVaToPhys(vmid, page);
+		lastPtr = phys ? physmapPtr(phys, 0x1000) : nullptr;
+		lastPage = lastPtr ? page : ~0ULL;
+		lastVmid = vmid;
+	}
+	return lastPtr ? reinterpret_cast<volatile uint32_t *>(lastPtr + (va & 0xFFF)) : nullptr;
+}
+
+static bool vceBridgeReloc(uint32_t vmid, uint64_t ibVa, uint32_t lo, uint32_t hi, uint64_t bytes) {
+	auto *pl = vceIbDword(vmid, ibVa + lo * 4);
+	uint32_t vlo = pl ? *pl : 0;
+	auto *ph = vceIbDword(vmid, ibVa + hi * 4);
+	uint32_t vhi = ph ? *ph : 0;
+	uint64_t addr = static_cast<uint64_t>(vhi) << 32 | vlo;
+	if (!pl || !ph || !addr)
+		return false;
+	uint64_t g = vceBridgeMap(vmid, addr, bytes);
+	if (!g)
+		return false;  // not a VMID address (already rewritten, or unmapped): left as it is
+	pl = vceIbDword(vmid, ibVa + lo * 4);
+	if (pl)
+		*pl = static_cast<uint32_t>(g);
+	ph = vceIbDword(vmid, ibVa + hi * 4);
+	if (ph)
+		*ph = static_cast<uint32_t>(g >> 32);
+	vceBridge.relocs++;
+	return true;
+}
+
+// A ring block (IB_VM vmid, IB lo, hi, length, then Apple's FENCE/TRAP/END) moved to VMID 0. False: left alone.
+static bool vceBridgeBlock(uint32_t *blk) {
+	auto &b = vceBridge;
+	if (checkKernelArgument("-crnovcebridge") || !vceBridgeInit())
+		return false;
+	uint32_t vmid = blk[1];
+	uint64_t ibVa = static_cast<uint64_t>(blk[3]) << 32 | blk[2];
+	uint32_t len = blk[4];
+	if (!vmid || !len || len > 0x4000)
+		return false;
+	uint64_t ibGart = vceBridgeMap(vmid, ibVa, static_cast<uint64_t>(len) * 4);
+	if (!ibGart)
+		return false;
+	// Linux's relocations (amdgpu_vce_ring_parse_cs, physical mode), with the extents it checks; Apple's extra
+	// packets (clock table 0x05000009, hw config 0x0500000C, aux 0x05000002) carry no address.
+	constexpr uint64_t Mb = 0x100000;
+	uint32_t fbIdx = 0, bsIdx = 0, packets = 0;
+	for (uint32_t idx = 0; idx < len && packets < 64; packets++) {
+		auto *pl = vceIbDword(vmid, ibVa + idx * 4);
+		uint32_t plen = pl ? *pl : 0;
+		auto *pc = vceIbDword(vmid, ibVa + (idx + 1) * 4);
+		uint32_t cmd = pc ? *pc : 0;
+		if (plen < 8 || (plen & 3) || idx + plen / 4 > len) {
+			b.badLen++;
+			break;
+		}
+		auto at = [&](uint32_t i) {
+			auto *p = vceIbDword(vmid, ibVa + (idx + i) * 4);
+			return p ? *p : 0;
+		};
+		switch (cmd) {
+			case 0x00000002:  // task info
+				fbIdx = at(6) == 0xFFFFFFFF ? 0 : at(6);
+				bsIdx = at(7) == 0xFFFFFFFF ? 0 : at(7);
+				break;
+			case 0x03000001:  // encode: luma, chroma
+				vceBridgeReloc(vmid, ibVa, idx + 10, idx + 9, 4 * Mb);
+				vceBridgeReloc(vmid, ibVa, idx + 12, idx + 11, 2 * Mb);
+				break;
+			case 0x05000001:  // context buffer
+				vceBridgeReloc(vmid, ibVa, idx + 3, idx + 2, 8 * Mb);
+				break;
+			case 0x05000004:  // bitstream
+				vceBridgeReloc(vmid, ibVa, idx + 3, idx + 2, static_cast<uint64_t>(at(4)) * (bsIdx + 1));
+				break;
+			case 0x05000005:  // feedback
+				vceBridgeReloc(vmid, ibVa, idx + 3, idx + 2, 4096ULL * (fbIdx + 1));
+				break;
+			case 0x0500000D:  // MV buffers
+				vceBridgeReloc(vmid, ibVa, idx + 3, idx + 2, 4 * Mb);
+				vceBridgeReloc(vmid, ibVa, idx + 8, idx + 7, 1 * Mb);
+				break;
+			case 0x00000001: case 0x01000001: case 0x02000001: case 0x04000001: case 0x04000002: case 0x04000005:
+			case 0x04000007: case 0x04000008: case 0x04000009: case 0x05000002: case 0x05000009: case 0x0500000C:
+				break;
+			default:
+				b.unknownCmds++;
+				if (b.lastUnknown != cmd && b.unknownCmds <= 8)
+					diskLogEvent("vce bridge: unknown packet %x (len %x) at dword %x of IB %llx", cmd, plen, idx, ibVa);
+				b.lastUnknown = cmd;
+				break;
+		}
+		idx += plen / 4;
+	}
+	__asm__ volatile("mfence" ::: "memory");
+	if (b.dirty) {
+		gpuMmio[0x51E] = 1;  // VM_INVALIDATE_REQUEST, context 0 (gmc_v8_0_flush_gpu_tlb)
+		b.dirty = false;
+	}
+	blk[1] = 0;
+	blk[2] = static_cast<uint32_t>(ibGart);
+	blk[3] = static_cast<uint32_t>(ibGart >> 32);
+	flushLines(reinterpret_cast<const uint8_t *>(blk), 0x20);
+	if (b.blocks++ < 12)
+		diskLogEvent("vce bridge: IB %llx (vmid %u, %u dwords, %u packets) -> gart %llx; maps %u (%u pages) reused %u "
+			"relocs %u fails %u unknown %u", ibVa, vmid, len, packets, ibGart, b.maps, b.pages, b.reuses, b.relocs,
+			b.mapFails, b.unknownCmds);
+	return true;
 }
 
 // For the VCE log: the walk's PTE flags, and the VMID's first directory entry.
