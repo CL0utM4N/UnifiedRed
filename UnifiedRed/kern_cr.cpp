@@ -6498,7 +6498,7 @@ static bool wrapVceContextInit(void *that, void *accel, void *videoContext, uint
 // of each ring through the GART.
 static const uint16_t vceRegs[] {0x8001, 0x8005, 0x8009, 0x800A, 0x800B, 0x800C, 0x800D, 0x800E, 0x8048, 0x805B,
 	0x805C, 0x805D, 0x805E, 0x805F, 0x8060, 0x8061, 0x8062, 0x8063, 0x8064, 0x85A6, 0x85A7, 0x85A8, 0x8616, 0x8617,
-	0x8618};
+	0x8618, 0x859D, 0x85AD, 0x85AE, 0x85B5, 0x85BD};
 static struct {
 	uint64_t ms;
 	uint32_t tails, heads, logged, regs[arrsize(vceRegs)], ring[2][24];
@@ -6549,7 +6549,7 @@ static void vceSnapshot(const char *why) {
 	if (s.logged >= 24 || !memcmp(old, s.regs, sizeof(old)))
 		return;
 	s.logged++;
-	char buf[400];
+	char buf[560];
 	size_t len = 0;
 	for (size_t i = 0; i < arrsize(vceRegs) && len + 16 < sizeof(buf); i++)
 		len += snprintf(buf + len, sizeof(buf) - len, " %x=%x", vceRegs[i], s.regs[i]);
@@ -6946,10 +6946,37 @@ static void vcePrependPtb(void *that) {
 	}
 }
 
+// The swap (log 1747208987): Linux's create message, which runs from our VRAM under VMID 0, written into Apple's IB and
+// run under VMID 7 from system memory, gave no fence either. So it is VCE's VMID 7 / system memory path, not Apple's IB.
+// Apple's start leaves VCE_LMI_CTRL (0x85A6) at 0x200000 (VCPU_DATA_COHERENCY_EN only); Linux's vce_v3_0_mc_resume
+// writes 0x00398000 on every VCE 3 part (bits 15, 16, 19, 20 unnamed). Before each LLQ submit, under the instance
+// select, add the missing bits; the first change is logged. -crnovcelmi leaves it.
+static constexpr uint32_t VceLmiCtrl = 0x85A6, VceLmiCtrlLinux = 0x00398000;
+static uint32_t vceLmiFixes;
+
+static void vceLmiFix() {
+	auto *m = gpuMmio;
+	if (!m || checkKernelArgument("-crnovcelmi"))
+		return;
+	m[0xC200] = 7;
+	uint32_t before = m[VceLmiCtrl], after = before;
+	if ((before & VceLmiCtrlLinux) != VceLmiCtrlLinux) {
+		m[VceLmiCtrl] = before | VceLmiCtrlLinux;
+		after = m[VceLmiCtrl];
+	}
+	uint32_t ctrl2 = m[0x859D], cache = m[0x85BD], vm = m[0x85A8];
+	m[0xC200] = 0xE0000000;
+	if (before != after && !vceLmiFixes++)
+		diskLogEvent("vce lmi: VCE_LMI_CTRL %x -> %x (Linux %x); CTRL2 %x CACHE_CTRL %x VM_CTRL %x", before, after,
+			VceLmiCtrlLinux, ctrl2, cache, vm);
+}
+
 static void wrapRingSubmit(void *that) {
 	auto kind = vceRingKind(that);
-	if (kind == 2)
+	if (kind == 2) {
+		vceLmiFix();
 		vceFenceProbe();
+	}
 	if (kind) {
 		vcePrependPtb(that);
 		vceRingLog("submit (before)", that, kind, 0);
