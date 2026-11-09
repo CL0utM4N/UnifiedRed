@@ -6509,6 +6509,7 @@ static void *vceRing1;
 static uint32_t vceProbeState;  // 0 not sent, 1 sent, 2 not possible
 static constexpr uint32_t VceProbeValue = 0xCAFE0001;
 static uint64_t vceProbeGart;  // the second probe fence, in ring 1's GART pages
+static uint32_t vceRing1Vm7State;  // the swap's VMID 7 copy on ring 1: 0 not sent, 1 sent, 2 failed
 
 static bool gartRead(uint64_t addr, uint32_t *out, uint32_t bytes) {
 	auto *m = gpuMmio;
@@ -6592,6 +6593,17 @@ static void vceLiveTick() {
 			diskLogEvent("vce probe: Linux create-session IB fence now %x (%s); feedback %x %x %x %x %x %x %x %x", v,
 				v == VceProbeValue + 2 ? "the session ran" : "not written", fb[0], fb[1], fb[2], fb[3], fb[4], fb[5],
 				fb[6], fb[7]);
+		}
+	}
+	static uint32_t vm7ProbeLogs, vm7ProbeLast = 1;
+	if (vceRing1Vm7State == 1 && vm7ProbeLogs < 4) {
+		auto *r = carvePtr(smuLoad.phys + Smu8::VcePdOffset, 0x3000);
+		uint32_t v = r ? *reinterpret_cast<volatile uint32_t *>(r + 0x108) : 0xFFFFFFFF;
+		if (r && v != vm7ProbeLast) {
+			vm7ProbeLast = v;
+			vm7ProbeLogs++;
+			diskLogEvent("vce probe: VMID 7 create IB on ring 1 fence now %x (%s)", v,
+				v == VceProbeValue + 4 ? "VMID 7 works on ring 1" : "not written");
 		}
 	}
 	static uint32_t sysProbeLogs, sysProbeLast = 1;
@@ -6906,12 +6918,43 @@ static void vceFenceProbe() {
 // then goes out as before. A fence means VMID 7 works and Apple's IB contents are the problem. It ends Apple's session.
 static uint32_t vceSwaps;
 
-static void vceSwapIb(uint32_t vmid, uint64_t va, uint32_t *ibCmd) {
+// Ring: Linux's jobs go on VCE ring 0 (VCE_RB_*, 0x8060), Apple's on RB2 (its "LLQ", 0x805B), and every probe that
+// worked ran on 0x8060. So the swap also writes a second copy (session handle 4) 0x500 bytes after the first, in the
+// same page, and sends it on ring 1 (0x8060) under the same VMID 7 page directory, Linux style (UPDATE_PTB, FLUSH_TLB,
+// END, IB_VM, FENCE 0xCAFE0005 to our region +0x108, END). Copy on ring 1 fences but Apple's ring doesn't: the ring is
+// the problem.
+static bool vceRing1Send(const uint32_t *cmd, uint32_t dwords) {
+	auto *m = gpuMmio;
+	auto *b = static_cast<uint8_t *>(vceRing1);
+	if (!m || !b || dwords > 0x20)
+		return false;
+	auto *ring = *reinterpret_cast<uint32_t **>(b + 0x40);
+	auto &size = *reinterpret_cast<uint32_t *>(b + 0x30);
+	auto &tail = *reinterpret_cast<uint32_t *>(b + 0x54);
+	auto &submitted = *reinterpret_cast<uint32_t *>(b + 0x74);
+	if (!ring || !size || size > 0x100000 || tail != submitted || tail + 0x20 > size || !b[0x70])
+		return false;
+	uint32_t *p = ring + tail;
+	memset(p, 0, 0x80);
+	memcpy(p, cmd, dwords * 4);
+	flushLines(reinterpret_cast<const uint8_t *>(p), 0x80);
+	__asm__ volatile("sfence" ::: "memory");
+	tail += 0x20;
+	if (tail >= size)
+		tail = 0;
+	submitted = tail;
+	m[0xC200] = 7;
+	m[0x8064] = tail;
+	m[0xC200] = 0xE0000000;
+	return true;
+}
+static void vceSwapIb(uint32_t vmid, uint64_t va, uint32_t *ibCmd, uint32_t pd) {
 	if (vceSwaps || !checkKernelArgument("-crvceswapib") || (va & 0xFFF) + 0x500 > 0x1000)
 		return;
 	vceSwaps++;
 	uint64_t phys = ibVaToPhys(vmid, va);
-	auto *p = phys ? physmapPtr(phys, 0x500) : nullptr;
+	bool second = (va & 0xFFF) + 0xA00 <= 0x1000;
+	auto *p = phys ? physmapPtr(phys, second ? 0xA00 : 0x500) : nullptr;
 	if (!p) {
 		diskLogEvent("vce swap: IB va %llx not mapped (phys %llx)", va, phys);
 		return;
@@ -6932,6 +6975,30 @@ static void vceSwapIb(uint32_t vmid, uint64_t va, uint32_t *ibCmd) {
 	flushLines(p, 0x500);
 	ibCmd[4] = dw;
 	diskLogEvent("vce swap: Apple's IB at va %llx (phys %llx) now Linux's create message, %u dwords", va, phys, dw);
+	auto *region = smuLoad.mc ? carvePtr(smuLoad.phys + Smu8::VcePdOffset, 0x3000) : nullptr;
+	if (!second || !region || !pd) {
+		vceRing1Vm7State = 2;
+		return;
+	}
+	uint64_t va2 = va + 0x500, fb2 = va2 + 0x400, mc = smuLoad.mc + Smu8::VcePdOffset;
+	auto *ib2 = reinterpret_cast<uint32_t *>(p + 0x500);
+	memset(ib2, 0, 0x500);
+	memcpy(ib2, create, sizeof(create));
+	ib2[2] = 4;
+	uint32_t dw2 = arrsize(create);
+	ib2[dw2++] = 0x14;
+	ib2[dw2++] = 0x05000005;
+	ib2[dw2++] = static_cast<uint32_t>(fb2 >> 32);
+	ib2[dw2++] = static_cast<uint32_t>(fb2);
+	ib2[dw2++] = 1;
+	flushLines(p + 0x500, 0x500);
+	*reinterpret_cast<volatile uint32_t *>(region + 0x108) = 0;
+	uint32_t cmd[] {0x107, vmid, pd, 0x108, vmid, 1, 0x102, vmid, static_cast<uint32_t>(va2),
+		static_cast<uint32_t>(va2 >> 32), dw2, 3, static_cast<uint32_t>(mc + 0x108), static_cast<uint32_t>((mc + 0x108) >> 32),
+		VceProbeValue + 4, 1};
+	vceRing1Vm7State = vceRing1Send(cmd, arrsize(cmd)) ? 1 : 2;
+	diskLogEvent("vce swap: second copy at va %llx on ring 1 under vmid %u (pd %x): %s", va2, vmid, pd,
+		vceRing1Vm7State == 1 ? "sent" : "ring 1 not usable");
 }
 
 static void vcePrependPtb(void *that) {
@@ -6967,7 +7034,7 @@ static void vcePrependPtb(void *that) {
 				memcpy(blk + 6, copy, used * 4);
 				for (uint32_t i = used + 6; i < 0x20; i++)
 					blk[i] = 0;
-				vceSwapIb(vmid, static_cast<uint64_t>(blk[6 + 3]) << 32 | blk[6 + 2], blk + 6);
+				vceSwapIb(vmid, static_cast<uint64_t>(blk[6 + 3]) << 32 | blk[6 + 2], blk + 6, pd);
 				if (vcePtbRewrites++ < 8)
 					diskLogEvent("vce ptb: block at %x: vmid %u page directory %x (%u dwords before, VM_CONTEXT cntl %x)",
 						pos, vmid, pd, used, m[0x504 + (vmid ? 1 : 0)]);
