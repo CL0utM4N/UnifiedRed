@@ -6595,6 +6595,27 @@ static void vceLiveTick() {
 				fb[6], fb[7]);
 		}
 	}
+	// The VM protection fault latches (gmc_8_1_d.h): context 0 at 0x536 status / 0x538 client / 0x53E page, contexts
+	// 1-15 at 0x537 / 0x539 / 0x53F. Until b9449e9 the "VM_CONTEXT1" line read context 0's. Status: protections 7:0,
+	// client ID 20:12, write 24, VMID 28:25; the client register holds 4 ASCII characters. Who faulted where. Logged when either changes once VCE ran.
+	static uint32_t vmFaultLogs, vmFaultLast[2];
+	if (vceProbeState && vmFaultLogs < 12) {
+		uint32_t st0 = m[0x536], st1 = m[0x537];
+		if (st0 != vmFaultLast[0] || st1 != vmFaultLast[1]) {
+			vmFaultLast[0] = st0;
+			vmFaultLast[1] = st1;
+			vmFaultLogs++;
+			uint32_t c0 = m[0x538], c1 = m[0x539];
+			auto ch = [](uint32_t v, int i) {
+				char c = static_cast<char>((v >> (24 - 8 * i)) & 0xFF);
+				return c >= 0x20 && c < 0x7F ? c : '.';
+			};
+			diskLogEvent("vm fault: ctx0 status %x page %x client %x (%c%c%c%c); ctx1-15 status %x (vmid %u) page %x "
+				"(va %llx) client %x (%c%c%c%c)", st0, m[0x53E], c0, ch(c0, 0), ch(c0, 1), ch(c0, 2), ch(c0, 3), st1,
+				(st1 >> 25) & 0xF, m[0x53F], static_cast<uint64_t>(m[0x53F]) << 12, c1, ch(c1, 0), ch(c1, 1), ch(c1, 2),
+				ch(c1, 3));
+		}
+	}
 	static uint32_t vm7ProbeLogs, vm7ProbeLast = 1;
 	if (vceRing1Vm7State == 1 && vm7ProbeLogs < 4) {
 		auto *r = carvePtr(smuLoad.phys + Smu8::VcePdOffset, 0x3000);
@@ -6690,9 +6711,9 @@ static void vceLiveTick() {
 			fenceLast[1] = fenceVal[1];
 		}
 		diskLogEvent("vce vm: cntl %x start %x end %x pdb%u %x; ib va %llx -> phys %llx%s; fence %llx = %x %x%s; "
-			"VM_CONTEXT1 fault status %x addr %x", m[0x505], m[0x558], m[0x560], vmid,
+			"fault ctx0 status %x addr %x, ctx1-15 status %x addr %x client %x", m[0x505], m[0x558], m[0x560], vmid,
 			vmid < 8 ? m[0x54F + vmid] : m[0x50E + vmid - 8], va, phys, ibOk ? "" : " (unread)", fence, fenceVal[0],
-			fenceVal[1], fenceOk ? "" : " (unread)", m[0x536], m[0x53E]);
+			fenceVal[1], fenceOk ? "" : " (unread)", m[0x536], m[0x53E], m[0x537], m[0x53F], m[0x539]);
 		if (ibOk) {
 			uint32_t dw = ring[at + 4] < arrsize(ib) ? ring[at + 4] : static_cast<uint32_t>(arrsize(ib));
 			for (uint32_t part = 0; part < dw; part += 32) {
