@@ -10929,6 +10929,35 @@ static bool uvdBridgeIb(uint32_t vmid, uint64_t ibVa, uint32_t len, uint64_t &ib
 				if (cmd == 0 && data0 != ~0U && data1 != ~0U)
 					msgVa = static_cast<uint64_t>(at(data1)) << 32 | at(data0);
 				// A decode message for H264_PERF: move the macroblock context into our own DPB (see uvdOwnDpb).
+				// Decode messages as Mesa writes them (radeon_uvd.c ruvd_end_frame), on every chip Polaris included:
+				// decode_flags 1 (Apple 0), and for a progressive frame the bottom-field offsets equal the top ones (Apple
+				// puts the plane ends there: luma bottom 0x17ffff, chroma bottom 0x23ffff). 9177161 log 1794547579 and before:
+				// the decoder stops after three macroblock rows whatever the firmware or context layout. -crnouvdmesamsg
+				// keeps Apple's. Also log Apple's dwords where Mesa's message has extension_support (byte 0xce0).
+				if (cmd == 0 && msgVa && !checkKernelArgument("-crnouvdmesamsg")) {
+					auto rd = [&](uint32_t i) {
+						auto *p = vceIbDword(vmid, msgVa + i * 4);
+						return p ? *p : 0;
+					};
+					auto wr = [&](uint32_t i, uint32_t v) {
+						if (auto *p = vceIbDword(vmid, msgVa + i * 4))
+							*p = v;
+					};
+					if (rd(1) == 1 && rd(0) >= 0x90) {
+						uint32_t flags = rd(5), lumaBottom = rd(33), chromaBottom = rd(35);
+						bool field = rd(31) != 0;  // dt_field_mode
+						if (!field) {
+							wr(5, 1);
+							wr(33, rd(32));
+							wr(35, rd(34));
+						}
+						static uint32_t msgFixLogs;
+						if (msgFixLogs++ < 2)
+							diskLogEvent("uvd msg: decode flags %x -> %x, luma bottom %x -> %x, chroma bottom %x -> %x (field %u); "
+								"size %x, dwords at 0xce0: %x %x %x %x", flags, rd(5), lumaBottom, rd(33), chromaBottom, rd(35),
+								field, rd(0), rd(0xCE0 / 4), rd(0xCE0 / 4 + 1), rd(0xCE0 / 4 + 2), rd(0xCE0 / 4 + 3));
+					}
+				}
 				// Opt-in experiment (-cruvdowndpb): neither Apple's Polaris firmware (805b16e log 1794547065) nor Stoney's
 				// (ef25f06 log 1794547579) decoded anything with the context in the DPB.
 				if (cmd == 0 && msgVa && checkKernelArgument("-cruvdowndpb")) {
