@@ -25,6 +25,7 @@
 #include <kern/clock.h>
 #include <IOKit/IOMessage.h>
 #include <IOKit/IORangeAllocator.h>
+#include <IOKit/IOBufferMemoryDescriptor.h>
 #include <IOKit/IOPlatformExpert.h>
 #include <IOKit/acpi/IOACPIPlatformDevice.h>
 
@@ -10366,7 +10367,9 @@ static struct {
 	uint32_t slots, next, entries, tailRun;
 	uint64_t tailValue;
 	uint32_t blocks, maps, pages, reuses, mapFails, relocs, unknownCmds, lastUnknown, badLen, wraps;
+	uint32_t uvdDpbSlot;  // first of the fixed slots for UVD's own DPB (0: none)
 } vceBridge;
+static constexpr uint32_t VceBridgeUvdDpbSlots = 0x1000;  // 16 MB
 
 // ended: the mapping stopped at an unmapped page short of what was asked (so it covers any request from its start);
 // job: the bridged job that last used it (slots of the last VceBridgeKeepJobs jobs aren't taken by a wrap).
@@ -10473,6 +10476,11 @@ static bool vceBridgeInit() {
 	b.slots = slots;
 	b.windowVa = (start + first) << 12;
 	b.pte = const_cast<uint64_t *>(ptes) + first;
+	// The top 16 MB of the window: fixed, for UVD's own DPB (uvdOwnDpbMap), outside the round robin.
+	if (checkKernelArgument("-cruvd") && b.slots > 0x3000) {
+		b.slots -= VceBridgeUvdDpbSlots;
+		b.uvdDpbSlot = b.slots;
+	}
 	b.ok = true;
 	diskLogEvent("vce bridge: window %u entries at GART %llx, %s", slots, b.windowVa, how);
 	return true;
@@ -10873,6 +10881,50 @@ static struct {
 	uint64_t bsVa, dpbVa, ctxVa;   // and bitstream (0x100), DPB (1), H264_PERF context (0x206)
 } uvdBridge;
 
+// a712cf8 log 1794546450: the first frame's luma has data in rows 0-47 only (3 macroblock rows), the firmware wrote its
+// status, and later frames are not decoded at all. Apple's messages keep H264_PERF's macroblock context in a separate
+// buffer (cmd 0x206, msg dpb_reserved), Polaris style; Mesa never does that on Stoney: there the context lives in the
+// DPB, sized as Linux's amdgpu_uvd_cs_msg_decode does without use_ctx_buf: images x N + macroblock context
+// (wmb x hmb x N x 192) + IT surface (wmb x hmb x 32). Our own DPB of that size (system memory, in the window's fixed
+// top slots), dpb_size set to it, dpb_reserved 0, the DPB command pointed at it and the 0x206 command a NO_OP.
+// N is Apple's own count (its DPB size / image size). -cruvdctx keeps Apple's layout.
+static struct {
+	IOBufferMemoryDescriptor *buf;
+	uint32_t pages, uses;
+	uint64_t gart;
+	bool failed;
+} uvdOwnDpb;
+
+static uint64_t uvdOwnDpbMap(uint32_t bytes) {
+	auto &d = uvdOwnDpb;
+	auto &b = vceBridge;
+	uint32_t pages = (bytes + 0xFFF) >> 12;
+	if (d.buf && d.pages >= pages)
+		return d.gart;
+	if (d.failed || !b.uvdDpbSlot || pages > VceBridgeUvdDpbSlots)
+		return 0;
+	OSSafeReleaseNULL(d.buf);
+	auto *buf = IOBufferMemoryDescriptor::withOptions(kIODirectionInOut, static_cast<vm_size_t>(pages) << 12, PAGE_SIZE);
+	if (!buf || buf->prepare() != kIOReturnSuccess) {
+		OSSafeReleaseNULL(buf);
+		d.failed = true;
+		diskLogEvent("uvd dpb: can't allocate %u pages", pages);
+		return 0;
+	}
+	bzero(buf->getBytesNoCopy(), static_cast<size_t>(pages) << 12);
+	for (uint32_t i = 0; i < pages; i++) {
+		IOByteCount len = 0;
+		addr64_t pa = buf->getPhysicalSegment(static_cast<IOByteCount>(i) << 12, &len, kIOMemoryMapperNone);
+		b.pte[b.uvdDpbSlot + i] = (pa & ~0xFFFULL) | 0x77;  // valid, system, snooped, readable, writeable (as the GART's own)
+	}
+	b.dirty = true;
+	d.buf = buf;
+	d.pages = pages;
+	d.gart = b.windowVa + (static_cast<uint64_t>(b.uvdDpbSlot) << 12);
+	diskLogEvent("uvd dpb: own DPB of %u pages at gart %llx", pages, d.gart);
+	return d.gart;
+}
+
 static uint64_t uvdCmdExtent(uint32_t cmd) {
 	switch (cmd) {
 		case 0: case 3: return 0x10000;      // message, feedback (Linux checks 2048)
@@ -10893,7 +10945,7 @@ static bool uvdBridgeIb(uint32_t vmid, uint64_t ibVa, uint32_t len, uint64_t &ib
 	};
 	uint32_t data0 = ~0U, data1 = ~0U, cmds = 0;
 	static uint32_t cmdLogs, regLog[48][2], regLogNum, msgDumps;
-	uint64_t msgVa = 0;
+	uint64_t msgVa = 0, ownDpb = 0;
 	for (uint32_t idx = 0; idx < len;) {
 		uint32_t hdr = at(idx), type = hdr >> 30;
 		if (type == 2) {  // PACKET2 filler
@@ -10926,6 +10978,46 @@ static bool uvdBridgeIb(uint32_t vmid, uint64_t ibVa, uint32_t len, uint64_t &ib
 				cmds++;
 				if (cmd == 0 && data0 != ~0U && data1 != ~0U)
 					msgVa = static_cast<uint64_t>(at(data1)) << 32 | at(data0);
+				// A decode message for H264_PERF: move the macroblock context into our own DPB (see uvdOwnDpb).
+				if (cmd == 0 && msgVa && !checkKernelArgument("-cruvdctx")) {
+					auto msg = [&](uint32_t i) {
+						auto *p = vceIbDword(vmid, msgVa + i * 4);
+						return p ? *p : 0;
+					};
+					if (msg(1) == 1 && msg(4) == 7 && msg(6) && msg(7) && msg(9)) {
+						uint32_t w = msg(6), h = msg(7), wmb = w / 16, hmb = ((h / 16) + 1) & ~1U;
+						uint32_t image = ((w * h + w * h / 2) + 1023) & ~1023U, num = msg(9) / image;
+						if (num < 1)
+							num = 1;
+						uint32_t size = ((image * num + wmb * hmb * num * 192 + wmb * hmb * 32) + 0xFFF) & ~0xFFFU;
+						uint32_t oldDpb = msg(9), oldReserved = msg(11);
+						ownDpb = uvdOwnDpbMap(size);
+						if (ownDpb) {
+							if (auto *p = vceIbDword(vmid, msgVa + 9 * 4))
+								*p = size;
+							if (auto *p = vceIbDword(vmid, msgVa + 11 * 4))
+								*p = 0;
+							static uint32_t dpbLogs;
+							if (dpbLogs++ < 2)
+								diskLogEvent("uvd dpb: decode %ux%u, %u pictures: dpb %x -> %x (context inside), reserved %x -> 0",
+									w, h, num, oldDpb, size, oldReserved);
+						}
+					}
+				}
+				if (cmd == 1 && ownDpb && data0 != ~0U && data1 != ~0U) {
+					if (auto *p = vceIbDword(vmid, ibVa + data0 * 4))
+						*p = static_cast<uint32_t>(ownDpb);
+					if (auto *p = vceIbDword(vmid, ibVa + data1 * 4))
+						*p = static_cast<uint32_t>(ownDpb >> 32);
+					data0 = data1 = ~0U;
+					continue;
+				}
+				if (cmd == 0x206 && ownDpb && count == 0) {
+					if (auto *h = vceIbDword(vmid, ibVa + idx * 4))
+						*h = 0x3BFF;
+					data0 = data1 = ~0U;
+					continue;
+				}
 				if (data0 != ~0U && data1 != ~0U) {
 					uint64_t a = static_cast<uint64_t>(at(data1)) << 32 | at(data0);
 					if (cmd == 0x100)
