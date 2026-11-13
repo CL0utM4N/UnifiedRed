@@ -10990,6 +10990,39 @@ static void uvdBridgeRing(void *that) {
 	// 61a9714 log 1794540246: decode ran but the target's luma stayed 0 and chroma 0x80 / ff00ff00; UVD_UDEC_ADDR_CONFIG,
 	// _DB_ and _DBW_ (0x3BD3-5) held 0x2011003 (Polaris-style: 8 pipes, row size 1) where Stoney's GB_ADDR_CONFIG is
 	// 0x2010001. Linux's uvd_v6_0_mc_resume sets all three to GB_ADDR_CONFIG. -crnouvdaddrcfg leaves them.
+	// d219732 log 1794544167: Stoney's own firmware decodes exactly as Apple's did (first rows only), so it's the hardware
+	// set-up. Linux's uvd_v6_0_start programs UVD_LMI_CTRL (0x302340: write clean timer 0x40 + enable, request mode, data
+	// and VCPU data coherency, disable on FWV fail), LMI/MP swap 0 and the MPC mux (MUXA0/B0 0x40c2040, A1/B1 0, MUX 0x88,
+	// ALU 0); Apple's CAIL does its Polaris version. Log Apple's values (and the clock gating) once, then set Linux's
+	// before each submit. -crnouvdlinuxregs keeps Apple's.
+	{
+		auto *m = gpuMmio;
+		static const struct {
+			uint16_t reg;
+			uint32_t value;
+		} linuxRegs[] {{0x3D66, 0x302340}, {0x3D6D, 0}, {0x3D6F, 0}, {0x3D79, 0x40C2040}, {0x3D7A, 0}, {0x3D7B, 0x40C2040},
+			{0x3D7C, 0}, {0x3D7E, 0}, {0x3D7D, 0x88}};
+		static bool logged;
+		if (!logged) {
+			logged = true;
+			diskLogEvent("uvd regs (Apple): LMI_CTRL %x LMI_SWAP %x MP_SWAP %x MUXA0 %x A1 %x B0 %x B1 %x MUX %x ALU %x; "
+				"LMI_CTRL2 %x MASTINT_EN %x CGC_CTRL %x CGC_GATE %x SUVD_CGC_CTRL %x SUVD_CGC_GATE %x", m[0x3D66], m[0x3D6D],
+				m[0x3D6F], m[0x3D79], m[0x3D7A], m[0x3D7B], m[0x3D7C], m[0x3D7D], m[0x3D7E], m[0x3D3D], m[0x3D40], m[0x3D2C],
+				m[0x3D2A], m[0x3BE6], m[0x3BE4]);
+		}
+		if (!checkKernelArgument("-crnouvdlinuxregs")) {
+			static uint32_t regFixes;
+			uint32_t changed = 0;
+			for (auto &r : linuxRegs)
+				if (m[r.reg] != r.value) {
+					m[r.reg] = r.value;
+					changed++;
+				}
+			if (changed && regFixes++ < 4)
+				diskLogEvent("uvd regs: %u set to Linux's values; now LMI_CTRL %x MUXA0 %x MUXB0 %x MUX %x", changed, m[0x3D66],
+					m[0x3D79], m[0x3D7B], m[0x3D7D]);
+		}
+	}
 	if (!checkKernelArgument("-crnouvdaddrcfg")) {
 		auto *m = gpuMmio;
 		uint32_t gb = m[0x263E];
