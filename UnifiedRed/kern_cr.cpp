@@ -4599,6 +4599,7 @@ namespace {
 		{"__ZN32AMDRadeonX4000_AMDBaffinHardware7powerUpEv", "hw.powerUp", InAccel, true, true, 0},
 		// Video engines (docs/VIDEO.md; powered only with -crvideo): firmware load and start, results in the summary.
 		{"__ZN29AMDRadeonX4000_AMDUVDHWEngine9loadUVDFWEv", "uvd.loadFW", InAccel, true, false, 0},
+		{"__ZN29AMDRadeonX4000_AMDUVDHWEngine27setupCacheWindowsAndFwvCailEv", "uvd.cacheWindows", InAccel, true, false, 0},
 		{"__ZN29AMDRadeonX4000_AMDUVDHWEngine13startRBEngineEv", "uvd.startRB", InAccel, true, false, 0},
 		{"__ZN29AMDRadeonX4000_AMDVCEHWEngine6loadFWEv", "vce.loadFW", InAccel, true, false, 0},
 		{"__ZN29AMDRadeonX4000_AMDVCEHWEngine5startEv", "vce.start", InAccel, true, false, 0},
@@ -6393,6 +6394,29 @@ static bool wrapUvdStart(void *that) {
 	info.ms = uptimeMs();
 	diskLogEvent("uvd start #%u = %d: status %x vcpu %x reset %x lmi %x tile1 %x", info.calls, ret, status, info.vcpu,
 		info.reset, info.lmi, info.tile);
+	// For loading Stoney's firmware (linux-firmware stoney_uvd.bin 1.43, ucode 0x439e0 bytes; Linux copies it to the
+	// VCPU buffer's start, window 0 from +256): what Apple set up. Engine +0x160 CPU address and +0x128 size of the
+	// firmware memory (loadUVDFW), the cache BAR, windows 0-2 (offsets in 8-byte units), and the image's first dwords.
+	if (info.calls <= 2) {
+		auto *e = static_cast<uint8_t *>(that);
+		auto *fwCpu = *reinterpret_cast<uint32_t **>(e + 0x160);
+		uint32_t fwSize = *reinterpret_cast<uint32_t *>(e + 0x128);
+		auto *m = gpuMmio;
+		uint64_t bar = static_cast<uint64_t>(m[0x3C5E]) << 32 | m[0x3C5F];
+		char head[200];
+		size_t p = 0;
+		for (uint32_t i = 0; fwCpu && i < 8 && p + 12 < sizeof(head); i++)
+			p += snprintf(head + p, sizeof(head) - p, " %x", fwCpu[i]);
+		char at[200];
+		p = 0;
+		uint32_t off0 = m[0x3D82] << 3;
+		for (uint32_t i = 0; fwCpu && off0 + 32 <= fwSize && i < 8 && p + 12 < sizeof(at); i++)
+			p += snprintf(at + p, sizeof(at) - p, " %x", fwCpu[off0 / 4 + i]);
+		diskLogEvent("uvd fw: memory cpu %p size %x (+0x138 %llx +0x168 %llx); cache bar %llx, windows %x/%x %x/%x %x/%x "
+			"(byte offset/size); image at 0:%s; at window 0:%s", fwCpu, fwSize, *reinterpret_cast<uint64_t *>(e + 0x138),
+			*reinterpret_cast<uint64_t *>(e + 0x168), bar, off0, m[0x3D83], m[0x3D84] << 3, m[0x3D85], m[0x3D86] << 3,
+			m[0x3D87], head, at);
+	}
 	traceNote("uvd.start=%d/%x ", ret, status);
 	if (ret && !(status & 2) && !checkKernelArgument("-crnouvdfwcheck")) {
 		uvdState = 3;
