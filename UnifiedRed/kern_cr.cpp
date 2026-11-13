@@ -10792,7 +10792,8 @@ static bool uvdBridgeIb(uint32_t vmid, uint64_t ibVa, uint32_t len, uint64_t &ib
 		return p ? *p : 0;
 	};
 	uint32_t data0 = ~0U, data1 = ~0U, cmds = 0;
-	static uint32_t cmdLogs;
+	static uint32_t cmdLogs, regLog[48][2], regLogNum, msgDumps;
+	uint64_t msgVa = 0;
 	for (uint32_t idx = 0; idx < len;) {
 		uint32_t hdr = at(idx), type = hdr >> 30;
 		if (type == 2) {  // PACKET2 filler
@@ -10807,6 +10808,15 @@ static bool uvdBridgeIb(uint32_t vmid, uint64_t ibVa, uint32_t len, uint64_t &ib
 		uint32_t reg = hdr & 0xFFFF, count = (hdr >> 16) & 0x3FFF;
 		for (uint32_t i = 0; i <= count && idx + 1 + i < len; i++) {
 			uint32_t r = reg + i, at1 = idx + 1 + i;
+			// 1b3f5d0 log 1794536434: the GPCOM commands start at dword 0xA1; which registers does the rest write?
+			bool known = false;
+			for (uint32_t k = 0; k < regLogNum; k++)
+				known |= regLog[k][0] == r;
+			if (!known && regLogNum < arrsize(regLog) && r != 0x3BFF) {
+				regLog[regLogNum][0] = r;
+				regLog[regLogNum++][1] = at(at1);
+				diskLogEvent("uvd bridge: IB %llx writes reg %x = %x (dword %x)", ibVa, r, at(at1), at1);
+			}
 			if (r == 0x3BC4)
 				data0 = at1;
 			else if (r == 0x3BC5)
@@ -10814,6 +10824,8 @@ static bool uvdBridgeIb(uint32_t vmid, uint64_t ibVa, uint32_t len, uint64_t &ib
 			else if (r == 0x3BC3) {
 				uint32_t cmd = at(at1) >> 1;
 				cmds++;
+				if (cmd == 0 && data0 != ~0U && data1 != ~0U)
+					msgVa = static_cast<uint64_t>(at(data1)) << 32 | at(data0);
 				if (data0 != ~0U && data1 != ~0U && vceBridgeReloc(vmid, ibVa, data0, data1, uvdCmdExtent(cmd)))
 					uvdBridge.relocs++;
 				if (cmdLogs++ < 16)
@@ -10824,6 +10836,17 @@ static bool uvdBridgeIb(uint32_t vmid, uint64_t ibVa, uint32_t len, uint64_t &ib
 			}
 		}
 		idx += count + 2;
+	}
+	// The message (create, then decode): compare with Linux's amdgpu_uvd_cs_msg / Mesa's ruvd_msg layout.
+	if (msgVa && msgDumps < 2) {
+		msgDumps++;
+		char buf[400];
+		size_t pos = 0;
+		for (uint32_t i = 0; i < 40 && pos + 12 < sizeof(buf); i++) {
+			auto *p = vceIbDword(vmid, msgVa + i * 4);
+			pos += snprintf(buf + pos, sizeof(buf) - pos, " %x", p ? *p : 0xDEADu);
+		}
+		diskLogEvent("uvd bridge: message at va %llx:%s", msgVa, buf);
 	}
 	return true;
 }
@@ -10860,6 +10883,15 @@ static void uvdBridgeRing(void *that) {
 				ring[vmidAt] = 0;
 				ring[hiAt] = static_cast<uint32_t>(ibGart >> 32);
 				ring[loAt] = static_cast<uint32_t>(ibGart);
+				// One frame as sent (pairs from the IB's VMID write, through the fence).
+				if (!u.ibs) {
+					char buf[480];
+					size_t p = 0;
+					uint32_t start = vmidAt >= 9 ? vmidAt - 9 : 0;
+					for (uint32_t i = 0; i < 0x40 && p + 12 < sizeof(buf); i++)
+						p += snprintf(buf + p, sizeof(buf) - p, " %x", ring[(start + i) % size]);
+					diskLogEvent("uvd bridge: ring frame from %x:%s", start, buf);
+				}
 				if (u.ibs++ < 12)
 					diskLogEvent("uvd bridge: IB %llx (vmid %u, %u dwords) -> gart %llx; relocs %u, unknown cmds %u", ibVa,
 						vmid, value, ibGart, u.relocs, u.unknown);
