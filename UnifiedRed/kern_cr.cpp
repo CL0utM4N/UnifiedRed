@@ -10409,11 +10409,12 @@ static bool vceBridgeReloc(uint32_t vmid, uint64_t ibVa, uint32_t lo, uint32_t h
 // with dual_pipe, off for Stoney and Polaris 11/12). On the first bridged create IB, three copies (relocated addresses,
 // their own session handles 7-9) go out on ring 1 under VMID 0 before Apple's: without all three, without hw config and
 // clock table, without hw config. Fences 0xCAFE0007-9 to our region +0x110/+0x114/+0x118. The first that lands names
-// the packet; one that fails may stop the ones after it.
+// the packet; one that fails may stop the ones after it. Answered (log 1747553499: the clock table), so -crvcevariants
+// only.
 static void vceSendVariants(uint32_t vmid, uint64_t ibVa, uint32_t len) {
 	auto *b = static_cast<uint8_t *>(vceRing1);
 	auto *region = smuLoad.mc ? carvePtr(smuLoad.phys + Smu8::VcePdOffset, 0x4000) : nullptr;
-	if (vceVariantsSent || !b || !region || !vceRing1Mc || len > 0x100 || checkKernelArgument("-crnovcevariants"))
+	if (vceVariantsSent || !b || !region || !vceRing1Mc || len > 0x100 || !checkKernelArgument("-crvcevariants"))
 		return;
 	vceVariantsSent = 1;
 	uint32_t ib[0x100];
@@ -10460,6 +10461,63 @@ static void vceSendVariants(uint32_t vmid, uint64_t ibVa, uint32_t len) {
 		if (sent)
 			vceVariantsSent = 2;
 	}
+}
+
+// 9ba44fb log 1747553499: Apple's create IB without hw config and the clock table ran (0xCAFE0008), without hw config
+// alone it didn't (0xCAFE0009): VCE here doesn't take Apple's clock table (0x05000009, all zeros), and Mesa's VCE 52
+// encoder sends neither packet on Stoney. Remove both from each of Apple's IBs (in place; the length shrinks), fixing
+// a task info's offsetOfNextTaskInfo (dword 2; 0xFFFFFFFF none) when packets between it and the next task info go.
+// Returns the new length. -crnovcefilter keeps them.
+static uint32_t vceFilterIb(uint32_t vmid, uint64_t ibVa, uint32_t len) {
+	static uint32_t filtered, logs;
+	if (len > 0x400 || checkKernelArgument("-crnovcefilter"))
+		return len;
+	static uint32_t ib[0x400], out[0x400], newAt[0x400 + 1];  // static: 12 KB is too much for a kernel stack
+	for (uint32_t i = 0; i < len; i++) {
+		auto *p = vceIbDword(vmid, ibVa + i * 4);
+		if (!p)
+			return len;
+		ib[i] = *p;
+	}
+	uint32_t n = 0, removed = 0, idx = 0;
+	while (idx < len) {
+		uint32_t words = ib[idx] / 4, cmd = idx + 1 < len ? ib[idx + 1] : 0;
+		if (ib[idx] < 8 || (ib[idx] & 3) || idx + words > len)
+			break;
+		bool drop = cmd == 0x05000009 || cmd == 0x0500000C;
+		for (uint32_t i = 0; i < words; i++)
+			newAt[idx + i] = n + (drop ? 0 : i);
+		if (drop) {
+			removed++;
+		} else {
+			memcpy(out + n, ib + idx, words * 4);
+			n += words;
+		}
+		idx += words;
+	}
+	if (!removed || idx != len)
+		return len;
+	newAt[len] = n;
+	// task info offsets (Mesa's task_info: offs = next task info packet - this packet + 3)
+	for (uint32_t i = 0; i + 2 < len;) {
+		uint32_t words = ib[i] / 4;
+		if (ib[i + 1] == 0x00000002 && ib[i + 2] != 0xFFFFFFFF && i + ib[i + 2] >= 3) {
+			uint32_t target = i + ib[i + 2] - 3;
+			if (target <= len && target > i)
+				out[newAt[i] + 2] = newAt[target] - newAt[i] + 3;
+		}
+		i += words;
+	}
+	for (uint32_t i = 0; i < n; i++) {
+		auto *p = vceIbDword(vmid, ibVa + i * 4);
+		if (p)
+			*p = out[i];
+	}
+	filtered++;
+	if (logs++ < 6)
+		diskLogEvent("vce filter: IB %llx: %u packet(s) removed (clock table / hw config), %u -> %u dwords (%u IBs so far)",
+			ibVa, removed, len, n, filtered);
+	return n;
 }
 
 // A ring block (IB_VM vmid, IB lo, hi, length, then Apple's FENCE/TRAP/END) moved to VMID 0. False: left alone.
@@ -10532,6 +10590,7 @@ static bool vceBridgeBlock(uint32_t *blk) {
 		b.dirty = false;
 	}
 	vceSendVariants(vmid, ibVa, len);
+	blk[4] = vceFilterIb(vmid, ibVa, len);
 	blk[1] = 0;
 	blk[2] = static_cast<uint32_t>(ibGart);
 	blk[3] = static_cast<uint32_t>(ibGart >> 32);
