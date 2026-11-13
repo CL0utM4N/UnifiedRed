@@ -10883,6 +10883,23 @@ static void uvdBridgeRing(void *that) {
 	if (!ring || !size || size > 0x100000 || tail >= size || pos >= size)
 		return;
 	u.rings++;
+	// 61a9714 log 1794540246: decode ran but the target's luma stayed 0 and chroma 0x80 / ff00ff00; UVD_UDEC_ADDR_CONFIG,
+	// _DB_ and _DBW_ (0x3BD3-5) held 0x2011003 (Polaris-style: 8 pipes, row size 1) where Stoney's GB_ADDR_CONFIG is
+	// 0x2010001. Linux's uvd_v6_0_mc_resume sets all three to GB_ADDR_CONFIG. -crnouvdaddrcfg leaves them.
+	if (!checkKernelArgument("-crnouvdaddrcfg")) {
+		auto *m = gpuMmio;
+		uint32_t gb = m[0x263E];
+		static uint32_t fixes;
+		if (gb && gb != 0xFFFFFFFF && (m[0x3BD3] != gb || m[0x3BD4] != gb || m[0x3BD5] != gb)) {
+			uint32_t was = m[0x3BD3];
+			m[0x3BD3] = gb;
+			m[0x3BD4] = gb;
+			m[0x3BD5] = gb;
+			if (fixes++ < 4)
+				diskLogEvent("uvd bridge: UDEC addr config %x -> %x (now %x %x %x)", was, gb, m[0x3BD3], m[0x3BD4],
+					m[0x3BD5]);
+		}
+	}
 	// The new dwords, as (register, value) pairs: find each IB's VMID/BAR/size writes.
 	uint32_t vmidAt = ~0U, hiAt = ~0U, loAt = ~0U;
 	for (uint32_t n = 0; pos != tail && n < 0x4000; n += 2) {
