@@ -79,9 +79,6 @@ check-sdk:
 $(OBJ_DIR)/%.cpp.o: %.cpp $(wildcard $(SRC_DIR)/*.hpp) | $(OBJ_DIR)
 	$(CXX) $(CXXFLAGS) -c $< -o $@
 
-# AMD's Stoney UVD firmware, embedded with .incbin (path relative to the repository root).
-$(OBJ_DIR)/kern_uvdfw.cpp.o: firmware/amdgpu/stoney_uvd.bin
-
 $(OBJ_DIR)/%.c.o: %.c | $(OBJ_DIR)
 	$(CC) $(CFLAGS) -DKMOD_START=$(PRODUCT_NAME)_kern_start -DKMOD_STOP=$(PRODUCT_NAME)_kern_stop -c $< -o $@
 
@@ -96,12 +93,7 @@ $(KEXT)/Contents/Info.plist: $(SRC_DIR)/Info.plist.in Makefile
 	    -e 's/@MODULE_VERSION@/$(MODULE_VERSION)/g' $< > $@
 	plutil -lint $@
 
-# The firmware's licence travels with the binary that contains it.
-$(KEXT)/Contents/Resources/LICENSE.amdgpu: firmware/LICENSE.amdgpu
-	@mkdir -p $(dir $@)
-	cp $< $@
-
-$(KEXT): $(BINARY) $(KEXT)/Contents/Info.plist $(KEXT)/Contents/Resources/LICENSE.amdgpu
+$(KEXT): $(BINARY) $(KEXT)/Contents/Info.plist
 	@touch $@
 	@echo "Built $@"
 
