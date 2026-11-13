@@ -10422,7 +10422,10 @@ static uint64_t vceBridgeMap(uint32_t vmid, uint64_t va, uint64_t bytes) {
 		// 769f7ef log 1747556201: a mapping cut short at an unmapped page never "fitted" the size asked again (context
 		// 8 MB asked, 1326 pages there), so every job remapped every buffer and the window wrapped 4 times in 0.5 s,
 		// over entries queued jobs still used, until job 89 hung.
-		bool fits = off + pages <= e.pages || e.ended;
+		// A cut-short mapping covers more than it has only for its own buffer (a request from its first page): one that
+		// starts inside it is another buffer the walk ran into, maybe cut by a gap (2327558 log 1794541933: UVD wrote
+		// only the first rows of its decode target and DPB).
+		bool fits = off + pages <= e.pages || (e.ended && !off);
 		if (fits && vmPteRaw(vmid, e.va) == e.pte0 &&
 			vmPteRaw(vmid, e.va + ((static_cast<uint64_t>(e.pages) - 1) << 12)) == e.pteN &&
 			vmPteRaw(vmid, e.va + ((static_cast<uint64_t>(e.pages) / 2) << 12)) == e.pteM) {
@@ -10471,6 +10474,13 @@ static uint64_t vceBridgeMap(uint32_t vmid, uint64_t va, uint64_t bytes) {
 		b.mapFails++;
 		return 0;
 	}
+	// 2327558 log 1794541933: UVD wrote the first rows of the decode target and DPB, nothing further: log the mappings
+	// (asked, mapped, and the entry where the walk stopped).
+	static uint32_t mapLogs;
+	if (mapLogs++ < 48)
+		diskLogEvent("bridge map: vmid %u va %llx asked %u pages, mapped %u at slot %x%s (stop entry %llx)", vmid, pageVa,
+			pages, done, slot, done < pages ? " (cut short)" : "",
+			done < pages ? vmPteRaw(vmid, pageVa + (static_cast<uint64_t>(done) << 12)) : 0);
 	// Mappings whose slots this one took are gone.
 	for (auto &e : vceBridgeMaps)
 		if (e.pages && e.slot < slot + done && slot < e.slot + e.pages)
@@ -11006,6 +11016,11 @@ static void uvdBridgeTick() {
 	bytes(u.ctxVa, ctx, sizeof(ctx));
 	diskLogEvent("uvd sample %u: bitstream va %llx:%s; dpb va %llx:%s |%s |%s; ctx va %llx:%s", samples, u.bsVa, bs, u.dpbVa,
 		dpb0, dpb1, dpb2, u.ctxVa, ctx);
+	// VM fault latches (context 0 is where the bridged UVD works), client as 4 characters.
+	uint32_t c0 = m[0x538];
+	diskLogEvent("uvd sample %u: ctx0 fault status %x page %x (va %llx) client %x (%c%c%c%c); ctx1-15 status %x page %x",
+		samples, m[0x536], m[0x53E], static_cast<uint64_t>(m[0x53E]) << 12, c0, (c0 >> 24) & 0x7F ?: '.',
+		(c0 >> 16) & 0x7F ?: '.', (c0 >> 8) & 0x7F ?: '.', c0 & 0x7F ?: '.', m[0x537], m[0x53F]);
 }
 
 // For the VCE log: the walk's PTE flags, and the VMID's first directory entry.
