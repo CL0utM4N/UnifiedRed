@@ -6905,8 +6905,15 @@ static uint32_t vceShadowPd(uint32_t applePd) {
 
 static void vceFenceProbe() {
 	auto *m = gpuMmio;
-	if (vceProbeState || !m || !smuLoad.mc || checkKernelArgument("-crnovceprobe"))
+	if (vceProbeState || !m || !smuLoad.mc)
 		return;
+	// The probes' work is done (fbf8a3a log 1747556980: 38 s screen recording through the bridge). They sent three
+	// Linux test sessions before Apple's at every VCE start and borrowed VMID 15: -crvceprobe only. State 2 keeps the
+	// VM fault log (it runs once VCE has started).
+	if (!checkKernelArgument("-crvceprobe")) {
+		vceProbeState = 2;
+		return;
+	}
 	auto *b = static_cast<uint8_t *>(vceRing1);
 	auto *target = carvePtr(smuLoad.phys + Smu8::VcePdOffset, 8);
 	if (!b || !target) {
