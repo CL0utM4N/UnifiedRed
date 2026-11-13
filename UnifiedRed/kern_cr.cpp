@@ -11017,10 +11017,10 @@ static void uvdBridgeTick() {
 	diskLogEvent("uvd sample %u: bitstream va %llx:%s; dpb va %llx:%s |%s |%s; ctx va %llx:%s", samples, u.bsVa, bs, u.dpbVa,
 		dpb0, dpb1, dpb2, u.ctxVa, ctx);
 	// VM fault latches (context 0 is where the bridged UVD works), client as 4 characters.
-	uint32_t c0 = m[0x538];
+	uint32_t client = m[0x538];
 	diskLogEvent("uvd sample %u: ctx0 fault status %x page %x (va %llx) client %x (%c%c%c%c); ctx1-15 status %x page %x",
-		samples, m[0x536], m[0x53E], static_cast<uint64_t>(m[0x53E]) << 12, c0, (c0 >> 24) & 0x7F ?: '.',
-		(c0 >> 16) & 0x7F ?: '.', (c0 >> 8) & 0x7F ?: '.', c0 & 0x7F ?: '.', m[0x537], m[0x53F]);
+		samples, m[0x536], m[0x53E], static_cast<uint64_t>(m[0x53E]) << 12, client, (client >> 24) & 0x7F ?: '.',
+		(client >> 16) & 0x7F ?: '.', (client >> 8) & 0x7F ?: '.', client & 0x7F ?: '.', m[0x537], m[0x53F]);
 }
 
 // For the VCE log: the walk's PTE flags, and the VMID's first directory entry.
