@@ -4599,7 +4599,6 @@ namespace {
 		{"__ZN32AMDRadeonX4000_AMDBaffinHardware7powerUpEv", "hw.powerUp", InAccel, true, true, 0},
 		// Video engines (docs/VIDEO.md; powered only with -crvideo): firmware load and start, results in the summary.
 		{"__ZN29AMDRadeonX4000_AMDUVDHWEngine9loadUVDFWEv", "uvd.loadFW", InAccel, true, false, 0},
-		{"__ZN29AMDRadeonX4000_AMDUVDHWEngine27setupCacheWindowsAndFwvCailEv", "uvd.cacheWindows", InAccel, true, false, 0},
 		{"__ZN29AMDRadeonX4000_AMDUVDHWEngine13startRBEngineEv", "uvd.startRB", InAccel, true, false, 0},
 		{"__ZN29AMDRadeonX4000_AMDVCEHWEngine6loadFWEv", "vce.loadFW", InAccel, true, false, 0},
 		{"__ZN29AMDRadeonX4000_AMDVCEHWEngine5startEv", "vce.start", InAccel, true, false, 0},
