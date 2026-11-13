@@ -10260,7 +10260,7 @@ static struct {
 	uint64_t *pte;      // slot 0's GART entry (carve-out, uncached)
 	uint32_t slots, next, entries, tailRun;
 	uint64_t tailValue;
-	uint32_t blocks, maps, pages, reuses, mapFails, relocs, unknownCmds, lastUnknown, badLen;
+	uint32_t blocks, maps, pages, reuses, mapFails, relocs, unknownCmds, lastUnknown, badLen, wraps;
 } vceBridge;
 
 static struct {
@@ -10336,8 +10336,11 @@ static uint64_t vceBridgeMap(uint32_t vmid, uint64_t va, uint64_t bytes) {
 		}
 		e.pages = 0;  // changed or too short: map afresh
 	}
-	if (b.next + pages > b.slots)
+	if (b.next + pages > b.slots) {
 		b.next = 0;
+		if (b.wraps++ < 4)
+			diskLogEvent("vce bridge: window wrapped (%u maps, %u pages so far)", b.maps, b.pages);
+	}
 	uint32_t slot = b.next, done = 0;
 	uint64_t first = 0, last = 0;
 	for (; done < pages; done++) {
@@ -10520,11 +10523,11 @@ static uint32_t vceFilterIb(uint32_t vmid, uint64_t ibVa, uint32_t len) {
 	return n;
 }
 
-// Any (hi, lo) dword pair in a packet that is an address in the VMID's range with a valid PTE: relocated (logged).
-// For Apple's packets Linux doesn't know, and for addresses its encode packet has beyond Linux's two.
+// Any (hi, lo) dword pair in a packet Linux doesn't know that is an address in the VMID's range with a valid PTE:
+// logged, and relocated only with -crvceguess (c83b5d3 relocated by default, and corrupted the encode packet's
+// reference picture fields).
 static void vceBridgeGuess(uint32_t vmid, uint64_t ibVa, uint32_t idx, uint32_t plen, uint32_t cmd) {
-	if (checkKernelArgument("-crnovceguess"))
-		return;
+	bool apply = checkKernelArgument("-crvceguess");
 	auto at = [&](uint32_t i) {
 		auto *p = vceIbDword(vmid, ibVa + (idx + i) * 4);
 		return p ? *p : 0;
@@ -10535,10 +10538,10 @@ static void vceBridgeGuess(uint32_t vmid, uint64_t ibVa, uint32_t idx, uint32_t 
 		uint64_t addr = static_cast<uint64_t>(at(k)) << 32 | at(k + 1);
 		if (addr < vmLo || addr >= vmHi || !vmPteRaw(vmid, addr))
 			continue;
-		bool ok = vceBridgeReloc(vmid, ibVa, idx + k + 1, idx + k, 0x400000);
+		bool ok = apply && vceBridgeReloc(vmid, ibVa, idx + k + 1, idx + k, 0x400000);
 		if (guessLogs++ < 24)
-			diskLogEvent("vce bridge: packet %x dword %u/%u: va %llx %s", cmd, k, k + 1, addr,
-				ok ? "relocated" : "not mapped");
+			diskLogEvent("vce bridge: packet %x dword %u/%u: va %llx looks like an address%s", cmd, k, k + 1, addr,
+				ok ? ", relocated" : apply ? ", not mapped" : " (left)");
 		k++;
 	}
 }
@@ -10587,9 +10590,15 @@ static bool vceBridgeBlock(uint32_t *blk) {
 						pos += snprintf(buf + pos, sizeof(buf) - pos, " %x", at(i));
 					diskLogEvent("vce bridge: encode packet (len %x) of IB %llx:%s", plen, ibVa, buf);
 				}
+				// Only these two: Mesa's encode packet gives the reference pictures as offsets in the context buffer
+				// (with type, frame number, POC), which c83b5d3's guess took for addresses at dwords 57-83.
 				vceBridgeReloc(vmid, ibVa, idx + 10, idx + 9, 4 * Mb);
 				vceBridgeReloc(vmid, ibVa, idx + 12, idx + 11, 2 * Mb);
-				vceBridgeGuess(vmid, ibVa, idx, plen, cmd);
+				break;
+			case 0x0500000A:  // Apple's: a per-frame buffer (hi, lo, size, count; log 1747555076: 4 28000 3000 2)
+				vceBridgeReloc(vmid, ibVa, idx + 3, idx + 2, at(4) ? static_cast<uint64_t>(at(4)) * (at(5) ? at(5) : 1) : 0x8000);
+				break;
+			case 0x0500000B: case 0x04000003: case 0x0400000E:  // Apple's, no address (log 1747555076)
 				break;
 			case 0x05000001:  // context buffer
 				vceBridgeReloc(vmid, ibVa, idx + 3, idx + 2, 8 * Mb);
