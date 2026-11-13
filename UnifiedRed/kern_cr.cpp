@@ -1578,6 +1578,7 @@ static mach_vm_address_t orgUvdStart;
 static bool wrapUvdStart(void *that);
 static void uvdLiveTick();
 static void vceLiveTick();
+static void uvdBridgeTick();
 static uint64_t ibMcToPhys(uint64_t addr, bool system);
 static uint64_t ibVaToPhys(uint32_t vmid, uint64_t va);
 static uint64_t vmWalkInfo(uint32_t vmid, uint64_t va, uint32_t *flags, uint64_t *pde0);
@@ -4125,6 +4126,7 @@ void CRDriver::watcherThread(void *arg, wait_result_t) {
 			self->panicReport(t, now, "UnifiedRed: deliberate panic (crpanicat), the kernel was still running.");
 		uvdLiveTick();
 		vceLiveTick();
+		uvdBridgeTick();
 		if (uvdPanicMs && uptimeMs() >= uvdPanicMs && !(uvdStartInfo.status & 2))
 			self->panicReport(t, now, "UnifiedRed: deliberate panic (-cruvdpanic), 20 s after the first UVD session.");
 		kickStalledFlip();
@@ -10770,7 +10772,8 @@ static bool vceBridgeBlock(uint32_t *blk) {
 // that each GPCOM_VCPU_CMD write (value >> 1: 0 message, 1 DPB, 2 decode target, 3 feedback, 0x100 bitstream, 0x204,
 // 0x206 context) uses; UVD 6 takes 64-bit addresses (address_64_bit from UVD 5). -crnouvdbridge leaves them.
 static struct {
-	uint32_t rings, ibs, relocs, unknown, bad, sessCtxDropped;
+	uint32_t rings, ibs, relocs, unknown, bad, sessCtxDropped, vmid;
+	uint64_t dtVa, fbVa, firstMs;  // the last decode target / feedback (VMID addresses), for the watcher's samples
 } uvdBridge;
 
 static uint64_t uvdCmdExtent(uint32_t cmd) {
@@ -10826,6 +10829,12 @@ static bool uvdBridgeIb(uint32_t vmid, uint64_t ibVa, uint32_t len, uint64_t &ib
 				cmds++;
 				if (cmd == 0 && data0 != ~0U && data1 != ~0U)
 					msgVa = static_cast<uint64_t>(at(data1)) << 32 | at(data0);
+				if ((cmd == 2 || cmd == 3) && data0 != ~0U && data1 != ~0U) {
+					(cmd == 2 ? uvdBridge.dtVa : uvdBridge.fbVa) = static_cast<uint64_t>(at(data1)) << 32 | at(data0);
+					uvdBridge.vmid = vmid;
+					if (!uvdBridge.firstMs)
+						uvdBridge.firstMs = uptimeMs();
+				}
 				// 8308b57 log 1794538811: the first job (cmd 5 + the create message) already hangs. Mesa sends the
 				// session context buffer (RUVD_CMD_SESSION_CONTEXT_BUFFER, 5) only from Polaris 10 on, never on Stoney;
 				// Apple's Polaris userspace sends it first in every IB. Turn that CMD write into a UVD_NO_OP write
@@ -10917,6 +10926,37 @@ static void uvdBridgeRing(void *that) {
 		gpuMmio[0x51E] = 1;  // VM_INVALIDATE_REQUEST, context 0
 		vceBridge.dirty = false;
 	}
+}
+
+// f5db4a5 log 1794539686: decode runs (no hang, every job fences) but the picture is garbage. Apple's decode target is
+// linear (dt_array_mode 0, pitch 0x800, chroma at 0x180000, dt_wa_chroma_top_offset 0x400 as Mesa sets on Stoney).
+// From 2 s after the first decode, a few times: bytes of the last decode target's luma (rows 0, 200, 400) and chroma,
+// the feedback buffer's first dwords, and UVD_UDEC_ADDR_CONFIG / DB / DBW (Linux's mc_resume: GB_ADDR_CONFIG).
+static void uvdBridgeTick() {
+	auto &u = uvdBridge;
+	static uint32_t samples;
+	if (!u.firstMs || samples >= 5 || uptimeMs() < u.firstMs + 2000 + samples * 1000 || !gpuMmio || !videoPowered())
+		return;
+	samples++;
+	auto *m = gpuMmio;
+	auto bytes = [&](uint64_t va, char *out, size_t room) {
+		size_t p = 0;
+		for (uint32_t i = 0; i < 4 && p + 12 < room; i++) {
+			uint64_t phys = u.vmid ? ibVaToPhys(u.vmid, va + i * 4) : 0;
+			uint32_t v = 0xDEADDEAD;
+			if (phys)
+				ibReadPhys(phys, 4, &v, false);
+			p += snprintf(out + p, room - p, " %08x", v);
+		}
+	};
+	char y0[64], y1[64], y2[64], c0[64], fb[64];
+	bytes(u.dtVa, y0, sizeof(y0));
+	bytes(u.dtVa + 200 * 0x800 + 0x200, y1, sizeof(y1));
+	bytes(u.dtVa + 400 * 0x800 + 0x400, y2, sizeof(y2));
+	bytes(u.dtVa + 0x180000 + 100 * 0x800 + 0x200, c0, sizeof(c0));
+	bytes(u.fbVa, fb, sizeof(fb));
+	diskLogEvent("uvd sample %u: dt va %llx luma%s |%s |%s chroma%s; feedback va %llx:%s; UDEC addr config %x db %x dbw %x "
+		"(GB_ADDR_CONFIG %x)", samples, u.dtVa, y0, y1, y2, c0, u.fbVa, fb, m[0x3BD3], m[0x3BD4], m[0x3BD5], m[0x263E]);
 }
 
 // For the VCE log: the walk's PTE flags, and the VMID's first directory entry.
