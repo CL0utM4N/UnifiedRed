@@ -1604,6 +1604,7 @@ static bool wrapVceContextInit(void *that, void *accel, void *videoContext, uint
 static mach_vm_address_t orgVceWriteTail, orgVceGetHead, orgRingEnable, orgRingDisable, orgRingSubmit, orgRingFlush,
 	orgVceRegLoc, orgVceLlqRegLoc, vceRingVtable, vceLlqRingVtable, orgGartInit, uvdDecRingVtable;
 static void uvdBridgeRing(void *that);
+static void vceBridgeForget();
 static bool wrapGartInit(void *that, void *hw, void *params);
 static void wrapVceWriteTail(void *that);
 static uint32_t wrapVceGetHead(void *that);
@@ -6374,6 +6375,7 @@ static bool wrapUvdStart(void *that) {
 	}
 	if (gpuMmio && videoPowered())
 		uvdPowerTilesUp();
+	vceBridgeForget();
 	bool ret = FunctionCast(wrapUvdStart, orgUvdStart)(that);
 	if (!gpuMmio)
 		return ret;
@@ -6842,8 +6844,10 @@ static void vceRingLog(const char *what, void *that, uint32_t kind, uint64_t ret
 
 static bool wrapRingEnable(void *that) {
 	auto kind = vceRingKind(that);
-	if (kind == 1)
+	if (kind == 1) {
 		vceRing1 = that;
+		vceBridgeForget();  // a VCE (re)start
+	}
 	bool ret = FunctionCast(wrapRingEnable, orgRingEnable)(that);
 	if (kind)
 		vceRingLog("enable", that, kind, ret);
@@ -10296,8 +10300,15 @@ static struct {
 static struct {
 	uint32_t vmid, slot, pages, job;
 	bool ended;
-	uint64_t va, pte0, pteN;
+	uint64_t va, pte0, pteN, pteM;
 } vceBridgeMaps[128];
+
+// Engine (re)start: forget cached mappings (711c96a log 1794540960: the second UVD session hung; a cache entry is only
+// checked at its first, middle and last page, and a new session reuses Apple's VAs with other pages).
+static void vceBridgeForget() {
+	for (auto &e : vceBridgeMaps)
+		e.pages = 0;
+}
 static uint32_t vceBridgeMapNext, vceBridgeJob;
 static constexpr uint32_t VceBridgeKeepJobs = 16;
 
@@ -10413,7 +10424,8 @@ static uint64_t vceBridgeMap(uint32_t vmid, uint64_t va, uint64_t bytes) {
 		// over entries queued jobs still used, until job 89 hung.
 		bool fits = off + pages <= e.pages || e.ended;
 		if (fits && vmPteRaw(vmid, e.va) == e.pte0 &&
-			vmPteRaw(vmid, e.va + ((static_cast<uint64_t>(e.pages) - 1) << 12)) == e.pteN) {
+			vmPteRaw(vmid, e.va + ((static_cast<uint64_t>(e.pages) - 1) << 12)) == e.pteN &&
+			vmPteRaw(vmid, e.va + ((static_cast<uint64_t>(e.pages) / 2) << 12)) == e.pteM) {
 			b.reuses++;
 			e.job = vceBridgeJob;
 			return b.windowVa + (static_cast<uint64_t>(e.slot) << 12) + (va - e.va);
@@ -10464,7 +10476,8 @@ static uint64_t vceBridgeMap(uint32_t vmid, uint64_t va, uint64_t bytes) {
 		if (e.pages && e.slot < slot + done && slot < e.slot + e.pages)
 			e.pages = 0;
 	auto &n = vceBridgeMaps[vceBridgeMapNext++ % arrsize(vceBridgeMaps)];
-	n = {vmid, slot, done, vceBridgeJob, done < pages, pageVa, first, last};
+	n = {vmid, slot, done, vceBridgeJob, done < pages, pageVa, first, last,
+		vmPteRaw(vmid, pageVa + (static_cast<uint64_t>(done / 2) << 12))};
 	b.next = slot + done;
 	b.maps++;
 	b.pages += done;
@@ -10774,6 +10787,7 @@ static bool vceBridgeBlock(uint32_t *blk) {
 static struct {
 	uint32_t rings, ibs, relocs, unknown, bad, sessCtxDropped, vmid;
 	uint64_t dtVa, fbVa, firstMs;  // the last decode target / feedback (VMID addresses), for the watcher's samples
+	uint64_t bsVa, dpbVa, ctxVa;   // and bitstream (0x100), DPB (1), H264_PERF context (0x206)
 } uvdBridge;
 
 static uint64_t uvdCmdExtent(uint32_t cmd) {
@@ -10829,6 +10843,15 @@ static bool uvdBridgeIb(uint32_t vmid, uint64_t ibVa, uint32_t len, uint64_t &ib
 				cmds++;
 				if (cmd == 0 && data0 != ~0U && data1 != ~0U)
 					msgVa = static_cast<uint64_t>(at(data1)) << 32 | at(data0);
+				if (data0 != ~0U && data1 != ~0U) {
+					uint64_t a = static_cast<uint64_t>(at(data1)) << 32 | at(data0);
+					if (cmd == 0x100)
+						uvdBridge.bsVa = a;
+					else if (cmd == 1)
+						uvdBridge.dpbVa = a;
+					else if (cmd == 0x206)
+						uvdBridge.ctxVa = a;
+				}
 				if ((cmd == 2 || cmd == 3) && data0 != ~0U && data1 != ~0U) {
 					(cmd == 2 ? uvdBridge.dtVa : uvdBridge.fbVa) = static_cast<uint64_t>(at(data1)) << 32 | at(data0);
 					uvdBridge.vmid = vmid;
@@ -10974,6 +10997,15 @@ static void uvdBridgeTick() {
 	bytes(u.fbVa, fb, sizeof(fb));
 	diskLogEvent("uvd sample %u: dt va %llx luma%s |%s |%s chroma%s; feedback va %llx:%s; UDEC addr config %x db %x dbw %x "
 		"(GB_ADDR_CONFIG %x)", samples, u.dtVa, y0, y1, y2, c0, u.fbVa, fb, m[0x3BD3], m[0x3BD4], m[0x3BD5], m[0x263E]);
+	// Is the input there (bitstream: H.264 data), and does the decoder write anything at all (DPB, context)?
+	char bs[64], dpb0[64], dpb1[64], dpb2[64], ctx[64];
+	bytes(u.bsVa, bs, sizeof(bs));
+	bytes(u.dpbVa, dpb0, sizeof(dpb0));
+	bytes(u.dpbVa + 0x100000, dpb1, sizeof(dpb1));
+	bytes(u.dpbVa + 0x300000, dpb2, sizeof(dpb2));
+	bytes(u.ctxVa, ctx, sizeof(ctx));
+	diskLogEvent("uvd sample %u: bitstream va %llx:%s; dpb va %llx:%s |%s |%s; ctx va %llx:%s", samples, u.bsVa, bs, u.dpbVa,
+		dpb0, dpb1, dpb2, u.ctxVa, ctx);
 }
 
 // For the VCE log: the walk's PTE flags, and the VMID's first directory entry.
