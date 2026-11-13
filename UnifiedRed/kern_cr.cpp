@@ -10979,7 +10979,9 @@ static bool uvdBridgeIb(uint32_t vmid, uint64_t ibVa, uint32_t len, uint64_t &ib
 				if (cmd == 0 && data0 != ~0U && data1 != ~0U)
 					msgVa = static_cast<uint64_t>(at(data1)) << 32 | at(data0);
 				// A decode message for H264_PERF: move the macroblock context into our own DPB (see uvdOwnDpb).
-				if (cmd == 0 && msgVa && !checkKernelArgument("-cruvdctx")) {
+				// Only with Stoney's firmware (805b16e log 1794547065: Apple's Polaris firmware decoded nothing at all with
+				// the context in the DPB; on Polaris Linux always uses the separate buffer).
+				if (cmd == 0 && msgVa && checkKernelArgument("-cruvdstoneyfw") && !checkKernelArgument("-cruvdctx")) {
 					auto msg = [&](uint32_t i) {
 						auto *p = vceIbDword(vmid, msgVa + i * 4);
 						return p ? *p : 0;
