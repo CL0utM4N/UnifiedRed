@@ -10520,6 +10520,29 @@ static uint32_t vceFilterIb(uint32_t vmid, uint64_t ibVa, uint32_t len) {
 	return n;
 }
 
+// Any (hi, lo) dword pair in a packet that is an address in the VMID's range with a valid PTE: relocated (logged).
+// For Apple's packets Linux doesn't know, and for addresses its encode packet has beyond Linux's two.
+static void vceBridgeGuess(uint32_t vmid, uint64_t ibVa, uint32_t idx, uint32_t plen, uint32_t cmd) {
+	if (checkKernelArgument("-crnovceguess"))
+		return;
+	auto at = [&](uint32_t i) {
+		auto *p = vceIbDword(vmid, ibVa + (idx + i) * 4);
+		return p ? *p : 0;
+	};
+	uint64_t vmLo = static_cast<uint64_t>(gpuMmio[0x558]) << 12, vmHi = (static_cast<uint64_t>(gpuMmio[0x560]) + 1) << 12;
+	static uint32_t guessLogs;
+	for (uint32_t k = 2; k + 1 < plen / 4; k++) {
+		uint64_t addr = static_cast<uint64_t>(at(k)) << 32 | at(k + 1);
+		if (addr < vmLo || addr >= vmHi || !vmPteRaw(vmid, addr))
+			continue;
+		bool ok = vceBridgeReloc(vmid, ibVa, idx + k + 1, idx + k, 0x400000);
+		if (guessLogs++ < 24)
+			diskLogEvent("vce bridge: packet %x dword %u/%u: va %llx %s", cmd, k, k + 1, addr,
+				ok ? "relocated" : "not mapped");
+		k++;
+	}
+}
+
 // A ring block (IB_VM vmid, IB lo, hi, length, then Apple's FENCE/TRAP/END) moved to VMID 0. False: left alone.
 static bool vceBridgeBlock(uint32_t *blk) {
 	auto &b = vceBridge;
@@ -10555,9 +10578,18 @@ static bool vceBridgeBlock(uint32_t *blk) {
 				fbIdx = at(6) == 0xFFFFFFFF ? 0 : at(6);
 				bsIdx = at(7) == 0xFFFFFFFF ? 0 : at(7);
 				break;
-			case 0x03000001:  // encode: luma, chroma
+			case 0x03000001:  // encode: luma, chroma (Linux); any other address Apple's version carries
+				if (static bool encDumped; !encDumped) {
+					encDumped = true;
+					char buf[400];
+					size_t pos = 0;
+					for (uint32_t i = 0; i < plen / 4 && i < 40 && pos + 12 < sizeof(buf); i++)
+						pos += snprintf(buf + pos, sizeof(buf) - pos, " %x", at(i));
+					diskLogEvent("vce bridge: encode packet (len %x) of IB %llx:%s", plen, ibVa, buf);
+				}
 				vceBridgeReloc(vmid, ibVa, idx + 10, idx + 9, 4 * Mb);
 				vceBridgeReloc(vmid, ibVa, idx + 12, idx + 11, 2 * Mb);
+				vceBridgeGuess(vmid, ibVa, idx, plen, cmd);
 				break;
 			case 0x05000001:  // context buffer
 				vceBridgeReloc(vmid, ibVa, idx + 3, idx + 2, 8 * Mb);
@@ -10575,12 +10607,28 @@ static bool vceBridgeBlock(uint32_t *blk) {
 			case 0x00000001: case 0x01000001: case 0x02000001: case 0x04000001: case 0x04000002: case 0x04000005:
 			case 0x04000007: case 0x04000008: case 0x04000009: case 0x05000002: case 0x05000009: case 0x0500000C:
 				break;
-			default:
+			default: {
+				// Apple's own packets (38797f2 log 1747554394: 0x04000003, 0x0400000E, 0x0500000A, 0x0500000B; after 14
+				// jobs VCE0 faulted under VMID 0 at VA 4:00070000, an address left in one of them). Each one's dwords
+				// are logged the first time, and any (hi, lo) dword pair in it that is a VMID address with a valid
+				// PTE is relocated like the known buffers (logged). -crnovceguess leaves them.
 				b.unknownCmds++;
-				if (b.lastUnknown != cmd && b.unknownCmds <= 8)
-					diskLogEvent("vce bridge: unknown packet %x (len %x) at dword %x of IB %llx", cmd, plen, idx, ibVa);
-				b.lastUnknown = cmd;
+				static uint32_t dumped[16], dumpedNum;
+				bool seen = false;
+				for (uint32_t i = 0; i < dumpedNum; i++)
+					seen |= dumped[i] == cmd;
+				if (!seen && dumpedNum < arrsize(dumped)) {
+					dumped[dumpedNum++] = cmd;
+					char buf[200];
+					size_t pos = 0;
+					for (uint32_t i = 0; i < plen / 4 && i < 16 && pos + 12 < sizeof(buf); i++)
+						pos += snprintf(buf + pos, sizeof(buf) - pos, " %x", at(i));
+					diskLogEvent("vce bridge: unknown packet %x (len %x) at dword %x of IB %llx:%s", cmd, plen, idx, ibVa,
+						buf);
+				}
+				vceBridgeGuess(vmid, ibVa, idx, plen, cmd);
 				break;
+			}
 		}
 		idx += plen / 4;
 	}
