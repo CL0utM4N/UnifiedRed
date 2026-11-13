@@ -10263,11 +10263,15 @@ static struct {
 	uint32_t blocks, maps, pages, reuses, mapFails, relocs, unknownCmds, lastUnknown, badLen, wraps;
 } vceBridge;
 
+// ended: the mapping stopped at an unmapped page short of what was asked (so it covers any request from its start);
+// job: the bridged job that last used it (slots of the last VceBridgeKeepJobs jobs aren't taken by a wrap).
 static struct {
-	uint32_t vmid, slot, pages;
+	uint32_t vmid, slot, pages, job;
+	bool ended;
 	uint64_t va, pte0, pteN;
-} vceBridgeMaps[48];
-static uint32_t vceBridgeMapNext;
+} vceBridgeMaps[128];
+static uint32_t vceBridgeMapNext, vceBridgeJob;
+static constexpr uint32_t VceBridgeKeepJobs = 16;
 
 static bool vceBridgeInit() {
 	auto &b = vceBridge;
@@ -10293,7 +10297,7 @@ static bool vceBridgeInit() {
 	while (run < b.entries && run < 0x10000 && ptes[b.entries - 1 - run] == b.tailValue)
 		run++;
 	b.tailRun = run;
-	constexpr uint32_t Margin = 64, MaxSlots = 0x4000, MinSlots = 0x800;
+	constexpr uint32_t Margin = 64, MaxSlots = 0xF000, MinSlots = 0x800;
 	uint32_t slots = run > Margin ? run - Margin : 0;
 	if (slots > MaxSlots)
 		slots = MaxSlots;
@@ -10328,20 +10332,43 @@ static uint64_t vceBridgeMap(uint32_t vmid, uint64_t va, uint64_t bytes) {
 		if (!e.pages || e.vmid != vmid || pageVa < e.va || pageVa >= e.va + (static_cast<uint64_t>(e.pages) << 12))
 			continue;
 		uint64_t off = (pageVa - e.va) >> 12;
-		bool fits = off + pages <= e.pages;
+		// 769f7ef log 1747556201: a mapping cut short at an unmapped page never "fitted" the size asked again (context
+		// 8 MB asked, 1326 pages there), so every job remapped every buffer and the window wrapped 4 times in 0.5 s,
+		// over entries queued jobs still used, until job 89 hung.
+		bool fits = off + pages <= e.pages || e.ended;
 		if (fits && vmPteRaw(vmid, e.va) == e.pte0 &&
 			vmPteRaw(vmid, e.va + ((static_cast<uint64_t>(e.pages) - 1) << 12)) == e.pteN) {
 			b.reuses++;
+			e.job = vceBridgeJob;
 			return b.windowVa + (static_cast<uint64_t>(e.slot) << 12) + (va - e.va);
 		}
 		e.pages = 0;  // changed or too short: map afresh
 	}
-	if (b.next + pages > b.slots) {
-		b.next = 0;
-		if (b.wraps++ < 4)
-			diskLogEvent("vce bridge: window wrapped (%u maps, %u pages so far)", b.maps, b.pages);
+	// Free slots: from the cursor on, wrapping, but not over a mapping one of the last jobs used.
+	uint32_t slot = b.next;
+	bool found = false;
+	for (uint32_t tries = 0; tries < 2 * arrsize(vceBridgeMaps) + 2 && !found; tries++) {
+		if (slot + pages > b.slots) {
+			slot = 0;
+			if (b.wraps++ < 4)
+				diskLogEvent("vce bridge: window wrapped (%u maps, %u pages so far)", b.maps, b.pages);
+		}
+		found = true;
+		for (auto &e : vceBridgeMaps)
+			if (e.pages && vceBridgeJob - e.job < VceBridgeKeepJobs && e.slot < slot + pages && slot < e.slot + e.pages) {
+				slot = e.slot + e.pages;
+				found = false;
+				break;
+			}
 	}
-	uint32_t slot = b.next, done = 0;
+	if (!found) {
+		b.mapFails++;
+		static uint32_t fullLogs;
+		if (fullLogs++ < 4)
+			diskLogEvent("vce bridge: window full for %u pages (job %u)", pages, vceBridgeJob);
+		return 0;
+	}
+	uint32_t done = 0;
 	uint64_t first = 0, last = 0;
 	for (; done < pages; done++) {
 		uint64_t e = vmPteRaw(vmid, pageVa + (static_cast<uint64_t>(done) << 12));
@@ -10361,7 +10388,7 @@ static uint64_t vceBridgeMap(uint32_t vmid, uint64_t va, uint64_t bytes) {
 		if (e.pages && e.slot < slot + done && slot < e.slot + e.pages)
 			e.pages = 0;
 	auto &n = vceBridgeMaps[vceBridgeMapNext++ % arrsize(vceBridgeMaps)];
-	n = {vmid, slot, done, pageVa, first, last};
+	n = {vmid, slot, done, vceBridgeJob, done < pages, pageVa, first, last};
 	b.next = slot + done;
 	b.maps++;
 	b.pages += done;
@@ -10556,6 +10583,7 @@ static bool vceBridgeBlock(uint32_t *blk) {
 	uint32_t len = blk[4];
 	if (!vmid || !len || len > 0x4000)
 		return false;
+	vceBridgeJob++;
 	uint64_t ibGart = vceBridgeMap(vmid, ibVa, static_cast<uint64_t>(len) * 4);
 	if (!ibGart)
 		return false;
