@@ -6514,6 +6514,8 @@ static uint64_t vceProbeGart;  // the second probe fence, in ring 1's GART pages
 static uint32_t vceRing1Vm7State;  // the swap's VMID 7 copy on ring 1: 0 not sent, 1 sent, 2 failed
 static uint32_t vceOwnVmid;  // the probe's own-page-table VMID (base register restored by the watcher), 0 none
 static uint64_t vceOwnMs;
+static uint64_t vceRing1Mc;  // ring 1's GART address (VCE_RB_BASE), from the probe
+static uint32_t vceVariantsSent;  // the bridge's create IB variants on ring 1 (fences +0x110.. in our region)
 
 static bool gartRead(uint64_t addr, uint32_t *out, uint32_t bytes) {
 	auto *m = gpuMmio;
@@ -6632,6 +6634,20 @@ static void vceLiveTick() {
 				"(va %llx) client %x (%c%c%c%c)", st0, m[0x53E], c0, ch(c0, 0), ch(c0, 1), ch(c0, 2), ch(c0, 3), st1,
 				(st1 >> 25) & 0xF, m[0x53F], static_cast<uint64_t>(m[0x53F]) << 12, c1, ch(c1, 0), ch(c1, 1), ch(c1, 2),
 				ch(c1, 3));
+		}
+	}
+	static uint32_t variantLogs, variantLast[3] {1, 1, 1};
+	if (vceVariantsSent == 2 && variantLogs < 9) {
+		auto *r = carvePtr(smuLoad.phys + Smu8::VcePdOffset, 0x3000);
+		static const char *const without[3] {"hw config, clock table, aux", "hw config, clock table", "hw config"};
+		for (uint32_t v = 0; r && v < 3; v++) {
+			uint32_t val = *reinterpret_cast<volatile uint32_t *>(r + 0x110 + v * 4);
+			if (val == variantLast[v])
+				continue;
+			variantLast[v] = val;
+			variantLogs++;
+			diskLogEvent("vce variant %u (Apple's create IB without %s) fence now %x (%s)", v + 7, without[v], val,
+				val == VceProbeValue + 6 + v ? "the session ran" : "not written");
 		}
 	}
 	static uint32_t ownProbeLogs, ownProbeLast = 1;
@@ -6937,6 +6953,7 @@ static void vceFenceProbe() {
 	// Second fence: system memory through the GART (Apple's fence is at 0x20000280), into ring 1's own last dwords,
 	// which nothing uses while its tail stays near the start.
 	uint64_t ringMc = static_cast<uint64_t>(m[0x8061]) << 32 | m[0x8060];
+	vceRing1Mc = ringMc;
 	vceProbeGart = ringMc + (static_cast<uint64_t>(size) - 4) * 4;
 	ring[size - 4] = 0;
 	uint32_t cmd[0x20] {3, static_cast<uint32_t>(mc), static_cast<uint32_t>(mc >> 32), VceProbeValue, 3,
@@ -10385,6 +10402,66 @@ static bool vceBridgeReloc(uint32_t vmid, uint64_t ibVa, uint32_t lo, uint32_t h
 	return true;
 }
 
+// Which of Apple's packets does VCE here not take? (da77116 log 1747552594: Apple's create IB, bridged to VMID 0, still
+// gives no fence, where Linux's create message runs.) Apple's IB (built for Baffin) has three packets Mesa's VCE 52
+// encoder doesn't send on Stoney: hw config 0x0500000C (the kernel takes it only on Kaveri, Mullins and Carrizo:
+// "needed for proper VCE DPM on some APUs"), the clock table 0x05000009, and the aux buffer 0x05000002 (Mesa: only
+// with dual_pipe, off for Stoney and Polaris 11/12). On the first bridged create IB, three copies (relocated addresses,
+// their own session handles 7-9) go out on ring 1 under VMID 0 before Apple's: without all three, without hw config and
+// clock table, without hw config. Fences 0xCAFE0007-9 to our region +0x110/+0x114/+0x118. The first that lands names
+// the packet; one that fails may stop the ones after it.
+static void vceSendVariants(uint32_t vmid, uint64_t ibVa, uint32_t len) {
+	auto *b = static_cast<uint8_t *>(vceRing1);
+	auto *region = smuLoad.mc ? carvePtr(smuLoad.phys + Smu8::VcePdOffset, 0x4000) : nullptr;
+	if (vceVariantsSent || !b || !region || !vceRing1Mc || len > 0x100 || checkKernelArgument("-crnovcevariants"))
+		return;
+	vceVariantsSent = 1;
+	uint32_t ib[0x100];
+	for (uint32_t i = 0; i < len; i++) {
+		auto *p = vceIbDword(vmid, ibVa + i * 4);
+		ib[i] = p ? *p : 0;
+	}
+	bool isCreate = false;
+	for (uint32_t idx = 0; idx + 1 < len && ib[idx] >= 8 && !(ib[idx] & 3); idx += ib[idx] / 4)
+		isCreate |= ib[idx + 1] == 0x01000001;
+	if (!isCreate) {
+		vceVariantsSent = 0;
+		return;
+	}
+	auto *ring = *reinterpret_cast<uint32_t **>(b + 0x40);
+	uint32_t size = *reinterpret_cast<uint32_t *>(b + 0x30);
+	if (!ring || size < 0x8000)
+		return;
+	static const uint32_t drops[3][3] {{0x0500000C, 0x05000009, 0x05000002}, {0x0500000C, 0x05000009, 0}, {0x0500000C, 0, 0}};
+	uint64_t mc = smuLoad.mc + Smu8::VcePdOffset;
+	for (uint32_t v = 0; v < 3; v++) {
+		// ring 1's GART pages from size/2 + 0x1000 on (the VMID 0 system memory probe uses the first one)
+		uint32_t pageDw = size / 2 + 0x400 * (v + 1);
+		uint32_t *dst = ring + pageDw;
+		uint32_t n = 0;
+		for (uint32_t idx = 0; idx + 1 < len && ib[idx] >= 8 && !(ib[idx] & 3); idx += ib[idx] / 4) {
+			uint32_t cmd = ib[idx + 1], words = ib[idx] / 4;
+			if (cmd == drops[v][0] || cmd == drops[v][1] || cmd == drops[v][2] || n + words > 0x400)
+				continue;
+			memcpy(dst + n, ib + idx, words * 4);
+			if (cmd == 0x00000001)
+				dst[n + 2] = 7 + v;  // own session handle
+			n += words;
+		}
+		flushLines(reinterpret_cast<const uint8_t *>(dst), 0x1000);
+		uint32_t off = 0x110 + v * 4;
+		*reinterpret_cast<volatile uint32_t *>(region + off) = 0;
+		uint64_t ibGart = vceRing1Mc + static_cast<uint64_t>(pageDw) * 4;
+		uint32_t cmd[] {0x102, 0, static_cast<uint32_t>(ibGart), static_cast<uint32_t>(ibGart >> 32), n, 3,
+			static_cast<uint32_t>(mc + off), static_cast<uint32_t>((mc + off) >> 32), VceProbeValue + 6 + v, 1};
+		bool sent = vceRing1Send(cmd, arrsize(cmd));
+		diskLogEvent("vce variant %u: Apple's create IB without %x %x %x: %u of %u dwords, IB gart %llx, %s", v + 7,
+			drops[v][0], drops[v][1], drops[v][2], n, len, ibGart, sent ? "sent" : "ring 1 not usable");
+		if (sent)
+			vceVariantsSent = 2;
+	}
+}
+
 // A ring block (IB_VM vmid, IB lo, hi, length, then Apple's FENCE/TRAP/END) moved to VMID 0. False: left alone.
 static bool vceBridgeBlock(uint32_t *blk) {
 	auto &b = vceBridge;
@@ -10454,6 +10531,7 @@ static bool vceBridgeBlock(uint32_t *blk) {
 		gpuMmio[0x51E] = 1;  // VM_INVALIDATE_REQUEST, context 0 (gmc_v8_0_flush_gpu_tlb)
 		b.dirty = false;
 	}
+	vceSendVariants(vmid, ibVa, len);
 	blk[1] = 0;
 	blk[2] = static_cast<uint32_t>(ibGart);
 	blk[3] = static_cast<uint32_t>(ibGart >> 32);
