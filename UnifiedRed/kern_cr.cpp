@@ -10770,7 +10770,7 @@ static bool vceBridgeBlock(uint32_t *blk) {
 // that each GPCOM_VCPU_CMD write (value >> 1: 0 message, 1 DPB, 2 decode target, 3 feedback, 0x100 bitstream, 0x204,
 // 0x206 context) uses; UVD 6 takes 64-bit addresses (address_64_bit from UVD 5). -crnouvdbridge leaves them.
 static struct {
-	uint32_t rings, ibs, relocs, unknown, bad;
+	uint32_t rings, ibs, relocs, unknown, bad, sessCtxDropped;
 } uvdBridge;
 
 static uint64_t uvdCmdExtent(uint32_t cmd) {
@@ -10826,6 +10826,18 @@ static bool uvdBridgeIb(uint32_t vmid, uint64_t ibVa, uint32_t len, uint64_t &ib
 				cmds++;
 				if (cmd == 0 && data0 != ~0U && data1 != ~0U)
 					msgVa = static_cast<uint64_t>(at(data1)) << 32 | at(data0);
+				// 8308b57 log 1794538811: the first job (cmd 5 + the create message) already hangs. Mesa sends the
+				// session context buffer (RUVD_CMD_SESSION_CONTEXT_BUFFER, 5) only from Polaris 10 on, never on Stoney;
+				// Apple's Polaris userspace sends it first in every IB. Turn that CMD write into a UVD_NO_OP write
+				// (Apple writes one register per PACKET0). -cruvdsessctx keeps it.
+				if (cmd == 5 && count == 0 && !checkKernelArgument("-cruvdsessctx")) {
+					if (auto *h = vceIbDword(vmid, ibVa + idx * 4)) {
+						*h = 0x3BFF;
+						uvdBridge.sessCtxDropped++;
+					}
+					data0 = data1 = ~0U;
+					continue;
+				}
 				if (data0 != ~0U && data1 != ~0U && vceBridgeReloc(vmid, ibVa, data0, data1, uvdCmdExtent(cmd)))
 					uvdBridge.relocs++;
 				if (cmdLogs++ < 16)
@@ -10893,8 +10905,8 @@ static void uvdBridgeRing(void *that) {
 					diskLogEvent("uvd bridge: ring frame from %x:%s", start, buf);
 				}
 				if (u.ibs++ < 12)
-					diskLogEvent("uvd bridge: IB %llx (vmid %u, %u dwords) -> gart %llx; relocs %u, unknown cmds %u", ibVa,
-						vmid, value, ibGart, u.relocs, u.unknown);
+					diskLogEvent("uvd bridge: IB %llx (vmid %u, %u dwords) -> gart %llx; relocs %u, unknown cmds %u, "
+						"session context dropped %u", ibVa, vmid, value, ibGart, u.relocs, u.unknown, u.sessCtxDropped);
 			}
 			vmidAt = hiAt = loAt = ~0U;
 		}
