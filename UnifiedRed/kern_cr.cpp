@@ -11122,6 +11122,38 @@ static void uvdBridgeTick() {
 	bytes(u.ctxVa, ctx, sizeof(ctx));
 	diskLogEvent("uvd sample %u: bitstream va %llx:%s; dpb va %llx:%s |%s |%s; ctx va %llx:%s", samples, u.bsVa, bs, u.dpbVa,
 		dpb0, dpb1, dpb2, u.ctxVa, ctx);
+	// 0e468cc log 1794545653: whatever changes (firmware, registers, mappings), only the start of each frame is written.
+	// How far exactly: every luma row (pitch 0x800, 768 rows) and chroma row (from 0x180000, 384 rows), first 16 bytes:
+	// rows with data, the last such row; and the feedback's first 16 dwords (the firmware's per-frame status).
+	if (u.dtVa && u.vmid) {
+		auto rowHasData = [&](uint64_t va) {
+			uint32_t v[4] {};
+			uint64_t phys = ibVaToPhys(u.vmid, va);
+			return phys && ibReadPhys(phys, sizeof(v), v, false) && (v[0] | v[1] | v[2] | v[3]);
+		};
+		uint32_t lumaRows = 0, lumaLast = 0, chromaRows = 0, chromaLast = 0;
+		for (uint32_t r = 0; r < 768; r++)
+			if (rowHasData(u.dtVa + static_cast<uint64_t>(r) * 0x800)) {
+				lumaRows++;
+				lumaLast = r;
+			}
+		for (uint32_t r = 0; r < 384; r++)
+			if (rowHasData(u.dtVa + 0x180000 + static_cast<uint64_t>(r) * 0x800)) {
+				chromaRows++;
+				chromaLast = r;
+			}
+		char fbs[200];
+		size_t p = 0;
+		for (uint32_t i = 0; i < 16 && p + 12 < sizeof(fbs); i++) {
+			uint32_t v = 0;
+			uint64_t phys = ibVaToPhys(u.vmid, u.fbVa + i * 4);
+			if (phys)
+				ibReadPhys(phys, 4, &v, false);
+			p += snprintf(fbs + p, sizeof(fbs) - p, " %x", v);
+		}
+		diskLogEvent("uvd sample %u: dt %llx luma rows with data %u (last %u), chroma %u (last %u); feedback:%s", samples,
+			u.dtVa, lumaRows, lumaLast, chromaRows, chromaLast, fbs);
+	}
 	// VM fault latches (context 0 is where the bridged UVD works), client as 4 characters.
 	uint32_t client = m[0x538];
 	diskLogEvent("uvd sample %u: ctx0 fault status %x page %x (va %llx) client %x (%c%c%c%c); ctx1-15 status %x page %x",
