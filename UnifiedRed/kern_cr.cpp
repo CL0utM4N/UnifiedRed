@@ -6370,7 +6370,7 @@ static bool uvdReadyForSession() {
 // uvd_v6_0_start waits for UVD_STATUS bit 1 (VCPU report) after releasing the VCPU. So after Apple's start, wait up to
 // 100 ms for that bit; without it fail the start, refuse sessions from then on, and fail later starts (the restart's)
 // without calling Apple's, which is what hung. The registers go into the report: a frozen boot loses its disk log.
-// Stoney's own UVD firmware (-cruvd on Stoney; -cruvdapplefw keeps Apple's). ddbbec8 log 1794543540: with Apple's
+// Stoney's own UVD firmware (-cruvd -cruvdstoneyfw on Stoney). ddbbec8 log 1794543540: with Apple's
 // Polaris firmware every buffer is mapped and nothing faults, yet the decoder writes only the first rows of each frame.
 // Apple's loadUVDFW copies its image (header 11111111 22222222 33333333 44444444, then code from +0x100) to the start of
 // the engine's firmware memory (+0x160 CPU address, +0x128 size; 0x2c4000 on the D509BA), and its cache windows are code
@@ -6381,7 +6381,9 @@ static bool uvdReadyForSession() {
 static uint32_t uvdFwSwapped;
 
 static void uvdSwapFirmware(void *engine) {
-	if (!engine || smuCarrizo || !checkKernelArgument("-cruvd") || checkKernelArgument("-cruvdapplefw"))
+	// Opt-in (-cruvdstoneyfw): d219732 log 1794544167 decoded exactly as Apple's firmware did, so it isn't needed for
+	// that, and the user prefers not to load a firmware blob unless it is.
+	if (!engine || smuCarrizo || !checkKernelArgument("-cruvd") || !checkKernelArgument("-cruvdstoneyfw"))
 		return;
 	auto *e = static_cast<uint8_t *>(engine);
 	auto *fw = *reinterpret_cast<uint8_t **>(e + 0x160);
