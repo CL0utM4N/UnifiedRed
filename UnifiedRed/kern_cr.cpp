@@ -1601,7 +1601,8 @@ static bool uvdReadyForSession();
 static mach_vm_address_t orgVceContextInit;
 static bool wrapVceContextInit(void *that, void *accel, void *videoContext, uint32_t *createInfo);
 static mach_vm_address_t orgVceWriteTail, orgVceGetHead, orgRingEnable, orgRingDisable, orgRingSubmit, orgRingFlush,
-	orgVceRegLoc, orgVceLlqRegLoc, vceRingVtable, vceLlqRingVtable, orgGartInit;
+	orgVceRegLoc, orgVceLlqRegLoc, vceRingVtable, vceLlqRingVtable, orgGartInit, uvdDecRingVtable;
+static void uvdBridgeRing(void *that);
 static bool wrapGartInit(void *that, void *hw, void *params);
 static void wrapVceWriteTail(void *that);
 static uint32_t wrapVceGetHead(void *that);
@@ -5238,28 +5239,36 @@ void CRDriver::patchAccelerator(KernelPatcher &patcher, size_t index, mach_vm_ad
 		route("__ZN33AMDRadeonX4000_AMDAccelVCEContext4initEP37AMDRadeonX4000_AMDGraphicsAcceleratorP35AMDRadeonX4000_"
 			  "AMDAccelVideoContextP23sVideoContextCreateInfo",
 			reinterpret_cast<mach_vm_address_t>(wrapVceContextInit), orgVceContextInit, nullptr, 0, "VCE context init");
-		if (checkKernelArgument("-crvce")) {
+		bool vceOn = checkKernelArgument("-crvce"), uvdOn = checkKernelArgument("-cruvd");
+		if (vceOn) {
 			route("__ZN28AMDRadeonX4000_AMDVCE3v4Ring9writeTailEv", reinterpret_cast<mach_vm_address_t>(wrapVceWriteTail),
 				orgVceWriteTail, nullptr, 0, "VCE writeTail");
-			// The VMID 0 bridge books its GART window in Apple's GART allocator (vceBridgeInit).
-			route("__ZN24AMDRadeonX4000_AMDHWGart4initEP30AMDRadeonX4000_IAMDHWInterfaceP16_GART_PARAMETERS",
-				reinterpret_cast<mach_vm_address_t>(wrapGartInit), orgGartInit, nullptr, 0, "GART init");
 			route("__ZN28AMDRadeonX4000_AMDVCE3v4Ring7getHeadEv", reinterpret_cast<mach_vm_address_t>(wrapVceGetHead),
 				orgVceGetHead, nullptr, 0, "VCE getHead");
+		}
+		if (vceOn || uvdOn) {
+			// The VMID 0 bridge (VCE and UVD) books its GART window in Apple's GART allocator (vceBridgeInit).
+			route("__ZN24AMDRadeonX4000_AMDHWGart4initEP30AMDRadeonX4000_IAMDHWInterfaceP16_GART_PARAMETERS",
+				reinterpret_cast<mach_vm_address_t>(wrapGartInit), orgGartInit, nullptr, 0, "GART init");
 			// The ring life cycle, logged for the two VCE ring classes only (by vtable). Polaris hardware (AMDBaffinHardware,
 			// AMDEllesmereHardware::allocateHWEngines) makes an AMDVCE3v4HWEngine with AMDVCE3v4Ring/LLQRing, not the
-			// AMDVIVCE* classes 754d92a watched (none of its hooks ran).
+			// AMDVIVCE* classes 754d92a watched (none of its hooks ran). UVD decode: AMDUVD6v3DecRing.
 			auto vt = patcher.solveSymbol(index, "__ZTV28AMDRadeonX4000_AMDVCE3v4Ring", slide, size);
 			auto vtLlq = patcher.solveSymbol(index, "__ZTV31AMDRadeonX4000_AMDVCE3v4LLQRing", slide, size);
+			auto vtUvd = patcher.solveSymbol(index, "__ZTV31AMDRadeonX4000_AMDUVD6v3DecRing", slide, size);
 			patcher.clearError();
+			if (vtUvd && uvdOn)
+				uvdDecRingVtable = vtUvd + 16;
 			if (vt && vtLlq) {
-				vceRingVtable = vt + 16;
-				vceLlqRingVtable = vtLlq + 16;
-				route("__ZN28AMDRadeonX4000_AMDVCE3v4Ring16registerLocationEv",
-					reinterpret_cast<mach_vm_address_t>(wrapVceRegLoc), orgVceRegLoc, nullptr, 0, "VCE registerLocation");
-				route("__ZN31AMDRadeonX4000_AMDVCE3v4LLQRing16registerLocationEv",
-					reinterpret_cast<mach_vm_address_t>(wrapVceLlqRegLoc), orgVceLlqRegLoc, nullptr, 0,
-					"VCE LLQ registerLocation");
+				if (vceOn) {
+					vceRingVtable = vt + 16;
+					vceLlqRingVtable = vtLlq + 16;
+					route("__ZN28AMDRadeonX4000_AMDVCE3v4Ring16registerLocationEv",
+						reinterpret_cast<mach_vm_address_t>(wrapVceRegLoc), orgVceRegLoc, nullptr, 0, "VCE registerLocation");
+					route("__ZN31AMDRadeonX4000_AMDVCE3v4LLQRing16registerLocationEv",
+						reinterpret_cast<mach_vm_address_t>(wrapVceLlqRegLoc), orgVceLlqRegLoc, nullptr, 0,
+						"VCE LLQ registerLocation");
+				}
 				routeAllowJcc = true;
 				route("__ZN24AMDRadeonX4000_AMDHWRing6enableEv", reinterpret_cast<mach_vm_address_t>(wrapRingEnable),
 					orgRingEnable, nullptr, 0, "ring enable");
@@ -7218,6 +7227,11 @@ static void vceLmiFix() {
 }
 
 static void wrapRingSubmit(void *that) {
+	if (uvdDecRingVtable && that && *reinterpret_cast<mach_vm_address_t *>(that) == uvdDecRingVtable) {
+		uvdBridgeRing(that);
+		FunctionCast(wrapRingSubmit, orgRingSubmit)(that);
+		return;
+	}
 	auto kind = vceRingKind(that);
 	if (kind == 2) {
 		vceLmiFix();
@@ -10745,6 +10759,120 @@ static bool vceBridgeBlock(uint32_t *blk) {
 			"relocs %u fails %u unknown %u", ibVa, vmid, len, packets, ibGart, b.maps, b.pages, b.reuses, b.relocs,
 			b.mapFails, b.unknownCmds);
 	return true;
+}
+
+// UVD through the same bridge (-cruvd). Stoney's UVD 6.2 has no VM (Linux: uvd_v6_0_ring_vm_funcs only from Polaris
+// 10; Carrizo/Stoney run uvd_v6_0_ring_phys_funcs), and Apple's IBs are at VMID 7 addresses (nvram17: IB 4:00000000,
+// VMID 7). Apple's ring frame (AMDUVD6v3DecChannel::initializeIndirectCommandBufferFrame, Monterey) is 0x40 dwords of
+// (register, value) pairs, NO_OP (0x3BFF) filled: UVD_LMI_RBC_IB_VMID 0x3DA1, IB_64BIT_BAR_HIGH 0x3C66, _LOW 0x3C67,
+// UVD_RBC_IB_SIZE 0x3DA2, then the fence (CONTEXT_ID 0x3DBD, GPCOM DATA1/DATA0/CMD 0x3BC5/0x3BC4/0x3BC3, in the ring
+// under VMID 0 already). In the IB, Linux's amdgpu_uvd_cs_reg: PACKET0 writes, GPCOM_VCPU_DATA0/DATA1 hold an address
+// that each GPCOM_VCPU_CMD write (value >> 1: 0 message, 1 DPB, 2 decode target, 3 feedback, 0x100 bitstream, 0x204,
+// 0x206 context) uses; UVD 6 takes 64-bit addresses (address_64_bit from UVD 5). -crnouvdbridge leaves them.
+static struct {
+	uint32_t rings, ibs, relocs, unknown, bad;
+} uvdBridge;
+
+static uint64_t uvdCmdExtent(uint32_t cmd) {
+	switch (cmd) {
+		case 0: case 3: return 0x10000;      // message, feedback (Linux checks 2048)
+		case 1: return 0x4000000;            // DPB
+		case 2: return 0x1000000;            // decode target
+		case 0x100: return 0x800000;         // bitstream
+		default: return 0x400000;            // 0x204, 0x206 and the rest
+	}
+}
+
+static bool uvdBridgeIb(uint32_t vmid, uint64_t ibVa, uint32_t len, uint64_t &ibGart) {
+	ibGart = vceBridgeMap(vmid, ibVa, static_cast<uint64_t>(len) * 4);
+	if (!ibGart)
+		return false;
+	auto at = [&](uint32_t i) {
+		auto *p = vceIbDword(vmid, ibVa + i * 4);
+		return p ? *p : 0;
+	};
+	uint32_t data0 = ~0U, data1 = ~0U, cmds = 0;
+	static uint32_t cmdLogs;
+	for (uint32_t idx = 0; idx < len;) {
+		uint32_t hdr = at(idx), type = hdr >> 30;
+		if (type == 2) {  // PACKET2 filler
+			idx++;
+			continue;
+		}
+		if (type != 0) {
+			if (uvdBridge.bad++ < 4)
+				diskLogEvent("uvd bridge: IB %llx dword %x: packet type %u (%x), stopped", ibVa, idx, type, hdr);
+			break;
+		}
+		uint32_t reg = hdr & 0xFFFF, count = (hdr >> 16) & 0x3FFF;
+		for (uint32_t i = 0; i <= count && idx + 1 + i < len; i++) {
+			uint32_t r = reg + i, at1 = idx + 1 + i;
+			if (r == 0x3BC4)
+				data0 = at1;
+			else if (r == 0x3BC5)
+				data1 = at1;
+			else if (r == 0x3BC3) {
+				uint32_t cmd = at(at1) >> 1;
+				cmds++;
+				if (data0 != ~0U && data1 != ~0U && vceBridgeReloc(vmid, ibVa, data0, data1, uvdCmdExtent(cmd)))
+					uvdBridge.relocs++;
+				if (cmdLogs++ < 16)
+					diskLogEvent("uvd bridge: IB %llx cmd %x (dword %x), address dwords %x/%x", ibVa, cmd, at1, data0, data1);
+				if (cmd != 0 && cmd != 1 && cmd != 2 && cmd != 3 && cmd != 0x100 && cmd != 0x204 && cmd != 0x206)
+					uvdBridge.unknown++;
+				data0 = data1 = ~0U;
+			}
+		}
+		idx += count + 2;
+	}
+	return true;
+}
+
+static void uvdBridgeRing(void *that) {
+	auto &u = uvdBridge;
+	if (checkKernelArgument("-crnouvdbridge") || !gpuMmio || !vceBridgeInit())
+		return;
+	auto *b = static_cast<uint8_t *>(that);
+	auto *ring = *reinterpret_cast<uint32_t **>(b + 0x40);
+	uint32_t size = *reinterpret_cast<uint32_t *>(b + 0x30), tail = *reinterpret_cast<uint32_t *>(b + 0x54),
+			 pos = *reinterpret_cast<uint32_t *>(b + 0x74);
+	if (!ring || !size || size > 0x100000 || tail >= size || pos >= size)
+		return;
+	u.rings++;
+	// The new dwords, as (register, value) pairs: find each IB's VMID/BAR/size writes.
+	uint32_t vmidAt = ~0U, hiAt = ~0U, loAt = ~0U;
+	for (uint32_t n = 0; pos != tail && n < 0x4000; n += 2) {
+		uint32_t at = pos, next = (pos + 1) % size;
+		uint32_t reg = ring[at], value = ring[next];
+		if (reg == 0x3DA1)
+			vmidAt = next;
+		else if (reg == 0x3C66)
+			hiAt = next;
+		else if (reg == 0x3C67)
+			loAt = next;
+		else if (reg == 0x3DA2 && vmidAt != ~0U && hiAt != ~0U && loAt != ~0U) {
+			uint32_t vmid = ring[vmidAt];
+			uint64_t ibVa = static_cast<uint64_t>(ring[hiAt]) << 32 | ring[loAt];
+			uint64_t ibGart = 0;
+			if (vmid && vmid < 16 && value && value <= 0x4000)
+				vceBridgeJob++;
+			if (vmid && vmid < 16 && value && value <= 0x4000 && uvdBridgeIb(vmid, ibVa, value, ibGart)) {
+				ring[vmidAt] = 0;
+				ring[hiAt] = static_cast<uint32_t>(ibGart >> 32);
+				ring[loAt] = static_cast<uint32_t>(ibGart);
+				if (u.ibs++ < 12)
+					diskLogEvent("uvd bridge: IB %llx (vmid %u, %u dwords) -> gart %llx; relocs %u, unknown cmds %u", ibVa,
+						vmid, value, ibGart, u.relocs, u.unknown);
+			}
+			vmidAt = hiAt = loAt = ~0U;
+		}
+		pos = (pos + 2) % size;
+	}
+	__asm__ volatile("mfence" ::: "memory");
+	if (vceBridge.dirty) {
+		gpuMmio[0x51E] = 1;  // VM_INVALIDATE_REQUEST, context 0
+		vceBridge.dirty = false;
+	}
 }
 
 // For the VCE log: the walk's PTE flags, and the VMID's first directory entry.
