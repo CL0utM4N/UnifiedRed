@@ -24,6 +24,7 @@
 #include <kern/debug.h>
 #include <kern/clock.h>
 #include <IOKit/IOMessage.h>
+#include <IOKit/IORangeAllocator.h>
 #include <IOKit/IOPlatformExpert.h>
 #include <IOKit/acpi/IOACPIPlatformDevice.h>
 
@@ -1600,7 +1601,8 @@ static bool uvdReadyForSession();
 static mach_vm_address_t orgVceContextInit;
 static bool wrapVceContextInit(void *that, void *accel, void *videoContext, uint32_t *createInfo);
 static mach_vm_address_t orgVceWriteTail, orgVceGetHead, orgRingEnable, orgRingDisable, orgRingSubmit, orgRingFlush,
-	orgVceRegLoc, orgVceLlqRegLoc, vceRingVtable, vceLlqRingVtable;
+	orgVceRegLoc, orgVceLlqRegLoc, vceRingVtable, vceLlqRingVtable, orgGartInit;
+static bool wrapGartInit(void *that, void *hw, void *params);
 static void wrapVceWriteTail(void *that);
 static uint32_t wrapVceGetHead(void *that);
 static bool wrapRingEnable(void *that);
@@ -5239,6 +5241,9 @@ void CRDriver::patchAccelerator(KernelPatcher &patcher, size_t index, mach_vm_ad
 		if (checkKernelArgument("-crvce")) {
 			route("__ZN28AMDRadeonX4000_AMDVCE3v4Ring9writeTailEv", reinterpret_cast<mach_vm_address_t>(wrapVceWriteTail),
 				orgVceWriteTail, nullptr, 0, "VCE writeTail");
+			// The VMID 0 bridge books its GART window in Apple's GART allocator (vceBridgeInit).
+			route("__ZN24AMDRadeonX4000_AMDHWGart4initEP30AMDRadeonX4000_IAMDHWInterfaceP16_GART_PARAMETERS",
+				reinterpret_cast<mach_vm_address_t>(wrapGartInit), orgGartInit, nullptr, 0, "GART init");
 			route("__ZN28AMDRadeonX4000_AMDVCE3v4Ring7getHeadEv", reinterpret_cast<mach_vm_address_t>(wrapVceGetHead),
 				orgVceGetHead, nullptr, 0, "VCE getHead");
 			// The ring life cycle, logged for the two VCE ring classes only (by vtable). Polaris hardware (AMDBaffinHardware,
@@ -10280,6 +10285,49 @@ static struct {
 static uint32_t vceBridgeMapNext, vceBridgeJob;
 static constexpr uint32_t VceBridgeKeepJobs = 16;
 
+// Apple's GART manager (AMDRadeonX4000_AMDHWGart, Monterey): init keeps the GART base address at +0x20, its size in
+// pages at +0x38, and an IORangeAllocator over those pages (withRange(pages, 0x20)) at +0x98; AMDHWGart::allocate and
+// ::reserve are that allocator's allocate / allocateRange in pages from the base. The bridge books its window there,
+// so Apple never hands those entries out.
+static void *vceGart;
+
+static bool wrapGartInit(void *that, void *hw, void *params) {
+	bool ret = FunctionCast(wrapGartInit, orgGartInit)(that, hw, params);
+	if (ret && !vceGart)
+		vceGart = that;
+	return ret;
+}
+
+// Book [first, first + slots) (entry indexes from the GART start) in Apple's allocator; if it's taken, let the
+// allocator choose and change first. False: no allocator (the window stays unbooked) or no room.
+static bool vceBridgeBook(uint64_t gartStart, uint32_t entries, uint32_t &first, uint32_t slots, const char *&how) {
+	how = "unbooked (no GART object)";
+	if (!vceGart)
+		return true;
+	auto *base = static_cast<uint8_t *>(vceGart);
+	auto *ra = OSDynamicCast(IORangeAllocator, *reinterpret_cast<OSObject **>(base + 0x98));
+	uint64_t appleBase = *reinterpret_cast<uint64_t *>(base + 0x20);
+	uint32_t applePages = *reinterpret_cast<uint32_t *>(base + 0x38);
+	if (!ra || appleBase != gartStart || applePages != entries) {
+		how = "unbooked (GART object doesn't match)";
+		diskLogEvent("vce bridge: Apple's GART object: allocator %p base %llx pages %x (registers: %llx, %x)", ra, appleBase,
+			applePages, gartStart, entries);
+		return true;
+	}
+	if (ra->allocateRange(first, slots)) {
+		how = "booked in Apple's GART allocator";
+		return true;
+	}
+	IORangeScalar got = 0;
+	if (ra->allocate(slots, &got, 1)) {
+		first = static_cast<uint32_t>(got);
+		how = "booked in Apple's GART allocator (its choice)";
+		return true;
+	}
+	how = "no room in Apple's GART allocator";
+	return false;
+}
+
 static bool vceBridgeInit() {
 	auto &b = vceBridge;
 	if (b.tried)
@@ -10317,11 +10365,16 @@ static bool vceBridgeInit() {
 		diskLogEvent("vce bridge: off, only %u free GART entries", slots);
 		return false;
 	}
+	const char *how = "";
+	if (!vceBridgeBook(start << 12, b.entries, first, slots, how) || first + slots > b.entries) {
+		diskLogEvent("vce bridge: off, %s (%u entries)", how, slots);
+		return false;
+	}
 	b.slots = slots;
 	b.windowVa = (start + first) << 12;
 	b.pte = const_cast<uint64_t *>(ptes) + first;
 	b.ok = true;
-	diskLogEvent("vce bridge: window %u entries at GART %llx", slots, b.windowVa);
+	diskLogEvent("vce bridge: window %u entries at GART %llx, %s", slots, b.windowVa, how);
 	return true;
 }
 
