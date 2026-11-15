@@ -806,6 +806,10 @@ static const char *pathAgdp[] {"/System/Library/Extensions/AppleGraphicsControl.
 static const char *pathPci[] {"/System/Library/Extensions/IOPCIFamily.kext/Contents/MacOS/IOPCIFamily",
 	"/System/Library/Extensions/IOPCIFamily.kext/IOPCIFamily"};
 static const char *pathBacklight[] {"/System/Library/Extensions/AppleBacklight.kext/Contents/MacOS/AppleBacklight"};
+// Apple's DCE 8 (Sea Islands: Bonaire, Hawaii) display controller, up to Monterey: drives GCN 2 APUs on their own
+// display engine with a Bonaire device-id (docs/OLDER_APUS.md).
+static const char *pathCIController[] {
+	"/System/Library/Extensions/AMD8000Controller.kext/Contents/MacOS/AMD8000Controller"};
 
 enum KextIndex : size_t {
 	KextRadeonX4000,
@@ -818,6 +822,7 @@ enum KextIndex : size_t {
 	KextAgdp,
 	KextPci,
 	KextBacklight,
+	KextCIController,
 	KextCount,
 };
 
@@ -847,6 +852,8 @@ static KernelPatcher::KextInfo kexts[KextCount] {
 	[KextPci] = {"com.apple.iokit.IOPCIFamily", pathPci, arrsize(pathPci), {true}, {}, KernelPatcher::KextInfo::Unloaded},
 	// OSBundleRequired Safe Boot: in the boot KC, loaded before Lilu runs.
 	[KextBacklight] = {"com.apple.driver.AppleBacklight", pathBacklight, arrsize(pathBacklight), {true}, {},
+		KernelPatcher::KextInfo::Unloaded},
+	[KextCIController] = {"com.apple.kext.AMD8000Controller", pathCIController, arrsize(pathCIController), {}, {},
 		KernelPatcher::KextInfo::Unloaded},
 };
 
@@ -1651,6 +1658,8 @@ void CRDriver::processKext(KernelPatcher &patcher, size_t index, mach_vm_address
 			patchInterrupts(patcher, index, slide, size);
 			startWatcher();
 		}
+		else if (i == KextCIController && isGcn2(family))
+			patchCIController(patcher, index, slide, size);
 		else if (i == KextPci)
 			patchPci(patcher, index, slide, size);
 		else if (i == KextBacklight) {
@@ -1672,8 +1681,14 @@ void CRDriver::processKext(KernelPatcher &patcher, size_t index, mach_vm_address
 				patcher.clearError();
 			}
 			patchSupport(patcher, index, slide, size);
-			patchPlls(patcher, index, slide, size);
-			patchPolicy(patcher, index, slide, size);
+			// GCN 2: the PLL remap and the policy hooks (VBIOS-call, AUX and DP fixes) are written for DCE 11.0 and
+			// its VBIOS, and several write DCE 11 registers. Log the VBIOS calls only.
+			if (isGcn2(family)) {
+				patchAtomLogGcn2(patcher, index, slide, size);
+			} else {
+				patchPlls(patcher, index, slide, size);
+				patchPolicy(patcher, index, slide, size);
+			}
 			traceSupport(patcher, index, slide, size);
 		}
 		else if (i == KextFramebuffer)
@@ -1708,6 +1723,54 @@ void CRDriver::processKext(KernelPatcher &patcher, size_t index, mach_vm_address
 		} else if (i == KextRadeonX4000HWLibs && !checkKernelArgument("-crnoaccel"))
 			traceKext(patcher, index, slide, size, i);
 		return;
+	}
+}
+
+// GCN 2 on Monterey: AMD8000Controller, Apple's own DCE 8 controller, with a Bonaire device-id. Its
+// CISharedController::getDisplayLimit() and ::getNumLineBuffers() return 6, as on Polaris (see below); Kaveri has 4
+// pipes and Kabini/Mullins 2. getDigLimit() (6) stays: Kaveri has 7 DIGs, Kabini 6. -crnopipes leaves them alone.
+void CRDriver::patchCIController(KernelPatcher &patcher, size_t index, mach_vm_address_t slide, size_t size) {
+	if (checkKernelArgument("-crnopipes"))
+		return;
+	KernelPatcher::RouteRequest requests[] {
+		{"__ZN18CISharedController15getDisplayLimitEv", wrapGetDisplayLimit},
+		{"__ZN18CISharedController17getNumLineBuffersEv", wrapGetNumLineBuffers},
+	};
+	if (patcher.routeMultiple(index, requests, slide, size)) {
+		SYSLOG("cr", "AMD8000Controller limited to %u display pipes", displayPipes(family));
+	} else {
+		SYSLOG("cr", "failed to route AMD8000Controller pipe limits (error %d)", patcher.getError());
+		patcher.clearError();
+	}
+}
+
+// GCN 2: every VBIOS command table Apple runs, with its first parameter bytes and result, into the disk log and the
+// report's event list. Nothing is changed (the Carrizo hook, wrapExecuteBiosCommandTable, rewrites DCE 11 calls).
+static mach_vm_address_t orgAtomGcn2;
+static uint32_t atomGcn2Calls, atomGcn2Failed;
+
+static uint8_t wrapAtomGcn2(void *that, uint32_t table, void *params, uint32_t flag) {
+	uint8_t p[12] {};
+	if (params)
+		memcpy(p, params, sizeof(p));
+	uint8_t ok = FunctionCast(wrapAtomGcn2, orgAtomGcn2)(that, table, params, flag);
+	uint32_t n = __atomic_fetch_add(&atomGcn2Calls, 1, __ATOMIC_RELAXED);
+	if (!(ok & 1))
+		__atomic_fetch_add(&atomGcn2Failed, 1, __ATOMIC_RELAXED);
+	if (n < 400 || !(ok & 1))
+		diskLogEvent("atom #%u table %x flag %x: %02x%02x%02x%02x %02x%02x%02x%02x %02x%02x%02x%02x -> %u", n, table, flag,
+			p[0], p[1], p[2], p[3], p[4], p[5], p[6], p[7], p[8], p[9], p[10], p[11], ok);
+	return ok;
+}
+
+void CRDriver::patchAtomLogGcn2(KernelPatcher &patcher, size_t index, mach_vm_address_t slide, size_t size) {
+	if (checkKernelArgument("-crnoatomlog"))
+		return;
+	KernelPatcher::RouteRequest request {"__ZN24AtiAtomBiosParserService23executeBiosCommandTableEjPvj", wrapAtomGcn2,
+		orgAtomGcn2};
+	if (!routeChecked(patcher, index, request, slide, size)) {
+		SYSLOG("cr", "failed to route executeBiosCommandTable (error %d)", patcher.getError());
+		patcher.clearError();
 	}
 }
 
@@ -4136,7 +4199,8 @@ const char *CRDriver::composeReportGcn2(uint32_t t, const char *tree) {
 			VBIOS::ImageProperty, image ? image->getLength() : 0,
 			dev && dev->getLength() >= 2 ? *static_cast<const uint16_t *>(dev->getBytesNoCopy()) : 0);
 	}
-	add("events:");
+	add("vbios calls %u, %u failed; controller trace: %s\nevents:", atomGcn2Calls, atomGcn2Failed,
+		traceSummary[0] ? traceSummary : "-");
 	for (uint32_t i = 0; i < arrsize(diskLogRecent); i++) {
 		auto &line = diskLogRecent[(diskLogRecentNext + i) % arrsize(diskLogRecent)];
 		if (line[0])
@@ -4197,7 +4261,8 @@ void CRDriver::gcn2Watch() {
 		now[0] = '\0';
 		describeChildren(iGPU, 0, now, sizeof(now));
 		// With the Polaris spoof: ask for AMD9500Controller as on Carrizo (see watcherThread), never for acceleration.
-		if (!controllerRequested && strstr(now, "AMD9500ControllerWrangler")) {
+		// AMD8000ControllerWrangler (Bonaire spoof, Monterey) or AMD9500ControllerWrangler (Polaris spoof).
+		if (!controllerRequested && strstr(now, "ControllerWrangler")) {
 			controllerRequested = true;
 			if (!iGPU->getProperty("LoadController")) {
 				iGPU->setProperty("LoadAMDSupport", true);

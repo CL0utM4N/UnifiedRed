@@ -140,6 +140,8 @@ private:
 	void startWatcher();
 	static void watcherThread(void *arg, wait_result_t);
 	void gcn2Watch();
+	void patchCIController(KernelPatcher &patcher, size_t index, mach_vm_address_t slide, size_t size);
+	void patchAtomLogGcn2(KernelPatcher &patcher, size_t index, mach_vm_address_t slide, size_t size);
 	const char *composeReportGcn2(uint32_t t, const char *tree);
 
 	void findByConfigSpace();

@@ -2,12 +2,14 @@
 """
 Build an OpenCore EFI for the MSI A78M-E35 V2 (A6-7400K, Kaveri) GCN 2 test desktop, macOS Sequoia.
 
-    python scripts/build_efi_a78m.py <work dir> [--unifiedred [--nopanicat] [--spoof [--accel]]] [--fchxhcifix]
+    python scripts/build_efi_a78m.py <work dir> [--unifiedred [--nopanicat] [--spoof|--bonaire [--accel]]] [--fchxhcifix]
                                                 [--args="..."] [--oclog] [--debugoc]
 
     --unifiedred  add UnifiedRed (Debug build) with -crdbg and crpanicat=60, the deliberate report panic
     --nopanicat   with --unifiedred: no crpanicat=60
     --spoof       with --unifiedred: device-id 0x67EF (Polaris 11) so Apple's drivers attach; -crnoaccel unless --accel
+    --bonaire     with --unifiedred, Monterey and older: device-id 0x665C (Bonaire, R7 260X) so AMD8000Controller, Apple's
+                  own DCE 8 display controller, drives the display; -crnoaccel unless --accel
     --fchxhcifix  github.com/CL0utM4N/FCHXHCIFix, its IOPCIPrimaryMatch extended to this board's xHCI (1022:7814)
     --debugoc     OpenCore's DEBUG binaries (unpacked/OpenCore-<ver>-DEBUG/); --oclog writes OpenCore's log to the stick
 
@@ -78,6 +80,7 @@ SSDTS = {  # compiled from docs/opencore or docs/gcn2/opencore/<name>.dsl into <
 # Polaris 11 (Baffin): in the IOPCIMatch lists of AMD9500Controller, AMDRadeonX4000 and HWServices. CAIL reads the
 # real device ID (0x1315) from config space and takes its Spectre (Kaveri) path (docs/OLDER_APUS.md).
 SPOOF_DEVICE_ID = bytes.fromhex("EF670000")
+BONAIRE_DEVICE_ID = bytes.fromhex("5C660000")
 IGPU = "PciRoot(0x0)/Pci(0x1,0x0)"
 
 # AppleUSBXHCI::reset() waits only 100 ms for USBCMD.HCRST to clear; the D509BA's FCH xHCI needs ~105 ms (see
@@ -133,9 +136,12 @@ def main():
     opts = sys.argv[1:]
     args = [a for a in opts if not a.startswith("--")]
     with_ur = "--unifiedred" in opts
-    with_spoof = "--spoof" in opts
+    with_bonaire = "--bonaire" in opts
+    with_spoof = "--spoof" in opts or with_bonaire
+    if "--spoof" in opts and with_bonaire:
+        die("--spoof and --bonaire are alternatives")
     if with_spoof and not with_ur:
-        die("--spoof needs --unifiedred (it supplies the VBIOS the Polaris drivers need)")
+        die("--spoof/--bonaire need --unifiedred (it supplies the VBIOS Apple's drivers need)")
     if len(args) != 1:
         sys.exit(__doc__)
     work = Path(args[0]).resolve()
@@ -195,7 +201,10 @@ def main():
     # --- DeviceProperties ---------------------------------------------------------------------------
     # Without UnifiedRed's spoof, keep Apple's AMDSupport (it matches any display-class 1002:xxxx device) off the iGPU:
     # IOPCIMatch compares the vendor-id property. The class code stays, so the firmware framebuffer keeps working.
-    gpu = {"device-id": SPOOF_DEVICE_ID} if with_spoof else {"vendor-id": bytes.fromhex("FFFF0000")}
+    if with_spoof:
+        gpu = {"device-id": BONAIRE_DEVICE_ID if with_bonaire else SPOOF_DEVICE_ID}
+    else:
+        gpu = {"vendor-id": bytes.fromhex("FFFF0000")}
     cfg["DeviceProperties"]["Add"] = {IGPU: gpu}
     cfg["DeviceProperties"]["Delete"] = {}
 
