@@ -9,6 +9,7 @@
 #include "kern_platprobe.hpp"
 #include "kern_cr.hpp"
 #include "kern_vbios.hpp"
+#include "kern_dce8map.hpp"
 #include "kern_sigs.hpp"
 
 #include <Headers/kern_api.hpp>
@@ -262,6 +263,21 @@ static bool routeChecked(KernelPatcher &patcher, size_t index, KernelPatcher::Ro
 
 // Short summary of the bring-up trace, repeated by the watcher so it survives the console scrolling.
 static char traceSummary[2560];
+// GCN 2 DCE 8 register translation (see dce8Translate).
+static bool dce8Remap;
+static mach_vm_address_t atomReadFn, atomReadEnd, atomWriteFn, atomWriteEnd, baffinReadFn, baffinReadEnd;
+static uint32_t dce8Moved, dce8Dropped, dce8DroppedWrites, dce8Atom, dce8LbFixes;
+static uint8_t dce8DroppedSeen[0x10000 / 8];
+static uint32_t dce8DroppedFirst[48], dce8DroppedFirstCount;
+// A small leaf function's end: the first "pop rbp; ret" (these accessors keep frame pointers), else 0x80 bytes.
+static mach_vm_address_t functionEnd(mach_vm_address_t start) {
+	auto *code = reinterpret_cast<const uint8_t *>(start);
+	for (size_t i = 0; i + 1 < 0x200; i++)
+		if (code[i] == 0x5D && code[i + 1] == 0xC3)
+			return start + i + 2;
+	return start + 0x80;
+}
+
 static uint16_t softPPTableSize, softPPTableRev;  // see setSoftPowerPlayTable
 
 static void diskLogEvent(const char *fmt, ...);
@@ -1685,6 +1701,15 @@ void CRDriver::processKext(KernelPatcher &patcher, size_t index, mach_vm_address
 			// its VBIOS, and several write DCE 11 registers. Log the VBIOS calls only.
 			if (isGcn2(family)) {
 				patchAtomLogGcn2(patcher, index, slide, size);
+				patchPlls(patcher, index, slide, size);  // GCN 2: the PLL limit only (3), no index remap
+				atomReadFn = patcher.solveSymbol(index, "__ZN13AtomBiosProxy9readReg32EPvj", slide, size);
+				patcher.clearError();
+				atomWriteFn = patcher.solveSymbol(index, "__ZN13AtomBiosProxy10writeReg32EPvjj", slide, size);
+				patcher.clearError();
+				atomReadEnd = atomReadFn ? functionEnd(atomReadFn) : 0;
+				atomWriteEnd = atomWriteFn ? functionEnd(atomWriteFn) : 0;
+				SYSLOG("cr", "AtomBiosProxy readReg32 %llx-%llx writeReg32 %llx-%llx", atomReadFn, atomReadEnd, atomWriteFn,
+					atomWriteEnd);
 			} else {
 				patchPlls(patcher, index, slide, size);
 				patchPolicy(patcher, index, slide, size);
@@ -1806,7 +1831,9 @@ void CRDriver::patchPolarisController(KernelPatcher &patcher, size_t index, mach
 		}
 	}
 
-	// See patchPlls.
+	// See patchPlls. GCN 2 keeps Apple's PLL indexes.
+	if (isGcn2(family))
+		return;
 	KernelPatcher::RouteRequest request {"__ZN17AMD9500Controller21hwSetCrtcToPixelClockEhhR11ClockParams",
 		wrapSetCrtcToPixelClock, orgSetCrtcToPixelClock};
 	if (!routeChecked(patcher, index, request, slide, size)) {
@@ -1850,7 +1877,9 @@ void CRDriver::patchPlls(KernelPatcher &patcher, size_t index, mach_vm_address_t
 }
 
 void *CRDriver::wrapCreatePllAssigner(void *controller, void *connectors, uint8_t numConnectors, uint8_t numPlls) {
-	uint8_t plls = numPlls > DisplayPlls ? DisplayPlls : numPlls;
+	// GCN 2 (DCE 8): PPLL1, PPLL2 and PPLL0, which Apple's indexes 0-2 already are in ATOM's numbering.
+	uint8_t limit = isGcn2(callback->family) ? 3 : DisplayPlls;
+	uint8_t plls = numPlls > limit ? limit : numPlls;
 	IOLog("UnifiedRed: PLL assigner: %u connectors, %u PLLs (Apple asked for %u)\n", numConnectors, plls, numPlls);
 	traceNote("plls=%u/%u ", plls, numPlls);
 	return FunctionCast(wrapCreatePllAssigner, callback->orgCreatePllAssigner)(controller, connectors, numConnectors,
@@ -1863,11 +1892,12 @@ uint64_t CRDriver::wrapSetPixelClock(void *that, void *clockParams, const void *
 		return FunctionCast(wrapSetPixelClock, callback->orgSetPixelClock)(that, clockParams, connectorInfo);
 	uint8_t info[InfoSize];
 	memcpy(info, connectorInfo, InfoSize);
-	uint8_t crtc = info[CrtcOffset], pll = info[PllOffset], atomPll = atomPllFor(pll);
+	uint8_t crtc = info[CrtcOffset], pll = info[PllOffset];
+	uint8_t atomPll = isGcn2(callback->family) ? pll : atomPllFor(pll);
 	info[PllOffset] = atomPll;
 	uint32_t clock = 0;
 	memcpy(&clock, static_cast<uint8_t *>(clockParams) + 0x08, sizeof(clock));
-	const char *note = pll >= DisplayPlls && pll <= 5 ? " (INVALID on the APU)" : "";
+	const char *note = pll >= (isGcn2(callback->family) ? 3 : DisplayPlls) && pll <= 5 ? " (INVALID on the APU)" : "";
 	if (ml_get_interrupts_enabled())
 		IOLog("UnifiedRed: setPixelClock crtc %u PLL %u -> ATOM %u, clock %u%s\n", crtc, pll, atomPll, clock, note);
 	traceEvent("setPixelClock crtc<<16|pll<<8|atom", true, (crtc << 16) | (pll << 8) | atomPll);
@@ -4199,8 +4229,12 @@ const char *CRDriver::composeReportGcn2(uint32_t t, const char *tree) {
 			VBIOS::ImageProperty, image ? image->getLength() : 0,
 			dev && dev->getLength() >= 2 ? *static_cast<const uint16_t *>(dev->getBytesNoCopy()) : 0);
 	}
-	add("vbios calls %u, %u failed; controller trace: %s\nevents:", atomGcn2Calls, atomGcn2Failed,
-		traceSummary[0] ? traceSummary : "-");
+	add("vbios calls %u, %u failed; dce8 map %s: moved %u, dropped %u (%u writes), vbios passed %u, lb fixes %u; "
+		"first dropped (w = write):", atomGcn2Calls, atomGcn2Failed, dce8Remap ? "on" : "off", dce8Moved, dce8Dropped,
+		dce8DroppedWrites, dce8Atom, dce8LbFixes);
+	for (uint32_t i = 0; i < dce8DroppedFirstCount && i < arrsize(dce8DroppedFirst); i++)
+		add(" %x%s", dce8DroppedFirst[i] & 0xFFFF, (dce8DroppedFirst[i] >> 31) ? "w" : "");
+	add("\ncontroller trace: %s\nevents:", traceSummary[0] ? traceSummary : "-");
 	for (uint32_t i = 0; i < arrsize(diskLogRecent); i++) {
 		auto &line = diskLogRecent[(diskLogRecentNext + i) % arrsize(diskLogRecent)];
 		if (line[0])
@@ -8367,7 +8401,14 @@ void CRDriver::patchInterrupts(KernelPatcher &patcher, size_t index, mach_vm_add
 		}
 	}
 	stormBreak = !checkKernelArgument("-crnostormbreak");
-	if (!checkKernelArgument("-crnoreglog")) {
+	// GCN 2: the register routes carry the DCE 8 translation, so they're installed even with -crnoreglog.
+	bool gcn2Map = isGcn2(family) && !checkKernelArgument("-crnodce8map");
+	if (gcn2Map) {
+		baffinReadFn = patcher.solveSymbol(index, "__ZN21BaffinRegisterService9readReg32Ej", slide, size);
+		patcher.clearError();
+		baffinReadEnd = baffinReadFn ? functionEnd(baffinReadFn) : 0;
+	}
+	if (!checkKernelArgument("-crnoreglog") || gcn2Map) {
 		KernelPatcher::RouteRequest regRequests[] {
 			{"__ZN21BaffinRegisterService9readReg32Ej", wrapRegRead32, orgRegRead32},
 			{"__ZN21BaffinRegisterService10writeReg32Ejj", wrapRegWrite32, orgRegWrite32},
@@ -8379,12 +8420,20 @@ void CRDriver::patchInterrupts(KernelPatcher &patcher, size_t index, mach_vm_add
 			{"__ZN21BaffinRegisterService10writeReg16Ejt", wrapWrite16, orgWrite16},
 			{"__ZN21BaffinRegisterService9writeReg8Ejh", wrapWrite8, orgWrite8},
 		};
+		// The translation is switched on before the routes go in: nothing calls them before this callback returns.
+		dce8Remap = gcn2Map && baffinReadFn && atomReadFn && atomWriteFn;
+		bool routed = true;
 		for (auto &request : regRequests) {
 			if (!routeChecked(patcher, index, request, slide, size)) {
 				SYSLOG("cr", "reglog: failed to route %s (error %d)", request.symbol, patcher.getError());
 				patcher.clearError();
+				routed = false;
 			}
 		}
+		if (gcn2Map)
+			SYSLOG("cr", "GCN 2: DCE 8 translation %s (%lu table entries; routes %s, readReg32 %llx, atom %llx/%llx)",
+				dce8Remap ? "active" : "NOT active", static_cast<unsigned long>(arrsize(Dce8Map::Entries)),
+				routed ? "ok" : "FAILED", baffinReadFn, atomReadFn, atomWriteFn);
 	}
 	if (!checkKernelArgument("-crnopcitrace")) {
 		KernelPatcher::RouteRequest pciRequests[] {
@@ -8462,9 +8511,74 @@ static uint32_t regReadDone(int flags, uint32_t value) {
 	return value;
 }
 
+// GCN 2 with AMD9500Controller (Polaris spoof): every register Apple's DCE 11.2 code reads or writes through
+// BaffinRegisterService is moved to its DCE 8 / GMC 7.1 / BIF 4.1 / OSS 2.0 offset (kern_dce8map.hpp, generated from
+// Linux's headers by scripts/dce8_regmap.py), or dropped when GCN 2 has no such register (write ignored, read 0).
+// Two callers are left alone: the VBIOS interpreter (AtomBiosProxy::readReg32/writeReg32 in AMDSupport call the same
+// service, and the APU's VBIOS already speaks DCE 8), recognised by the return address, and readReg32's own nested
+// hwReadReg32 call, whose offset is translated already. -crnodce8map turns the translation off.
+// (state declared at the top of the file, with the other globals)
+
+static bool fromAtom(mach_vm_address_t ra) {
+	return (ra >= atomReadFn && ra < atomReadEnd) || (ra >= atomWriteFn && ra < atomWriteEnd);
+}
+
+// byteOffset in, translated byte offset out; false: no GCN 2 register, drop the access.
+static bool dce8Translate(uint32_t &byteOffset, bool write, uint32_t value, mach_vm_address_t ra) {
+	if (fromAtom(ra)) {
+		__atomic_fetch_add(&dce8Atom, 1, __ATOMIC_RELAXED);
+		return true;
+	}
+	uint32_t dword = byteOffset >> 2;
+	if (dword >= 0x10000)
+		return true;
+	uint32_t to = Dce8Map::translate(dword);
+	if (to == dword)
+		return true;
+	if (to == Dce8Map::None) {
+		__atomic_fetch_add(&dce8Dropped, 1, __ATOMIC_RELAXED);
+		if (write)
+			__atomic_fetch_add(&dce8DroppedWrites, 1, __ATOMIC_RELAXED);
+		uint8_t bit = static_cast<uint8_t>(1U << (dword & 7));
+		if (!(__atomic_fetch_or(&dce8DroppedSeen[dword >> 3], bit, __ATOMIC_RELAXED) & bit)) {
+			uint32_t n = __atomic_fetch_add(&dce8DroppedFirstCount, 1, __ATOMIC_RELAXED);
+			if (n < arrsize(dce8DroppedFirst))
+				dce8DroppedFirst[n] = dword | (write ? 0x80000000U : 0);
+			if (n < 200)
+				diskLogEvent("dce8: no GCN 2 register for Polaris 0x%x (%s %x)", dword, write ? "write" : "read",
+					write ? value : 0);
+		}
+		return false;
+	}
+	__atomic_fetch_add(&dce8Moved, 1, __ATOMIC_RELAXED);
+	byteOffset = (to << 2) | (byteOffset & 3);
+	return true;
+}
+
+// LB_MEMORY_CTRL (DCE 8: dword 0x1AC1 in each pipe's block, +0x300 / 0x2600 + 0x300 * (n - 2)): Apple writes
+// LB_MEMORY_SIZE 0x404 for Polaris's shared line buffer; Linux dce_v8_0_line_buffer_adjust() programs 0x6B0, with
+// LB_MEMORY_CONFIG 0 (the whole buffer), as the Carrizo fix does. -crnolbfix disables.
+static uint32_t dce8LbFix(uint32_t dword, uint32_t value) {
+	if (lbFixOff)
+		return value;
+	if (dword == 0x1AC1 || dword == 0x1DC1 || dword == 0x40C1 || dword == 0x43C1) {
+		uint32_t fixed = (value & ~0x300FFFu) | 0x6B0;
+		if (fixed != value) {
+			__atomic_fetch_add(&dce8LbFixes, 1, __ATOMIC_RELAXED);
+			return fixed;
+		}
+	}
+	return value;
+}
+
 // readReg32 reads through hwReadReg32 (vtable +0x160), so with -crreglogall each such read shows twice; the inner one
 // is marked "/0x1".
 uint32_t CRDriver::wrapHwRead32(void *that, uint32_t offset) {
+	if (dce8Remap) {
+		auto ra = reinterpret_cast<mach_vm_address_t>(__builtin_return_address(0));
+		if (!(ra >= baffinReadFn && ra < baffinReadEnd) && !dce8Translate(offset, false, 0, ra))
+			return 0;
+	}
 	int flags = regAccess(RegRead, offset, 1, 0);
 	if (flags & RegBlocked)
 		return 0;
@@ -8472,6 +8586,8 @@ uint32_t CRDriver::wrapHwRead32(void *that, uint32_t offset) {
 }
 
 uint32_t CRDriver::wrapRead16(void *that, uint32_t offset) {
+	if (dce8Remap && !dce8Translate(offset, false, 0, reinterpret_cast<mach_vm_address_t>(__builtin_return_address(0))))
+		return 0;
 	int flags = regAccess(RegRead, offset & ~3u, 16, 0);
 	if (flags & RegBlocked)
 		return 0;
@@ -8479,6 +8595,8 @@ uint32_t CRDriver::wrapRead16(void *that, uint32_t offset) {
 }
 
 uint32_t CRDriver::wrapRead8(void *that, uint32_t offset) {
+	if (dce8Remap && !dce8Translate(offset, false, 0, reinterpret_cast<mach_vm_address_t>(__builtin_return_address(0))))
+		return 0;
 	int flags = regAccess(RegRead, offset & ~3u, 8, 0);
 	if (flags & RegBlocked)
 		return 0;
@@ -8486,16 +8604,24 @@ uint32_t CRDriver::wrapRead8(void *that, uint32_t offset) {
 }
 
 void CRDriver::wrapWrite16(void *that, uint32_t offset, uint32_t value) {
+	if (dce8Remap &&
+		!dce8Translate(offset, true, value, reinterpret_cast<mach_vm_address_t>(__builtin_return_address(0))))
+		return;
 	if (!(regAccess(RegWrite, offset & ~3u, 16, value) & RegBlocked))
 		FunctionCast(wrapWrite16, callback->orgWrite16)(that, offset, value);
 }
 
 void CRDriver::wrapWrite8(void *that, uint32_t offset, uint32_t value) {
+	if (dce8Remap &&
+		!dce8Translate(offset, true, value, reinterpret_cast<mach_vm_address_t>(__builtin_return_address(0))))
+		return;
 	if (!(regAccess(RegWrite, offset & ~3u, 8, value) & RegBlocked))
 		FunctionCast(wrapWrite8, callback->orgWrite8)(that, offset, value);
 }
 
 uint32_t CRDriver::wrapRegRead32(void *that, uint32_t offset) {
+	if (dce8Remap && !dce8Translate(offset, false, 0, reinterpret_cast<mach_vm_address_t>(__builtin_return_address(0))))
+		return 0;
 	int flags = regAccess(RegRead, offset, 0, 0);
 	if (flags & RegBlocked)
 		return 0;
@@ -8510,6 +8636,16 @@ uint32_t CRDriver::wrapRegRead32(void *that, uint32_t offset) {
 // keep Apple's other fields. -crnolbfix disables.
 
 void CRDriver::wrapRegWrite32(void *that, uint32_t offset, uint32_t value) {
+	if (dce8Remap) {
+		auto ra = reinterpret_cast<mach_vm_address_t>(__builtin_return_address(0));
+		if (!dce8Translate(offset, true, value, ra))
+			return;
+		if (!fromAtom(ra))
+			value = dce8LbFix(offset >> 2, value);
+		if (!(regAccess(RegWrite, offset, 0, value) & RegBlocked))
+			FunctionCast(wrapRegWrite32, callback->orgRegWrite32)(that, offset, value);
+		return;
+	}
 	if (!lbFixOff) {
 		uint32_t dword = offset >> 2;
 		if (dword == 0x1AC1 || dword == 0x1CC1 || dword == 0x1EC1) {
@@ -8621,7 +8757,10 @@ static void moveIhRing(void *manager) {
 void CRDriver::wrapIhSetHardwareEnabled(void *that, bool enable) {
 	if (enable)
 		moveIhRing(that);
-	bool off = enable && checkKernelArgument("-crnoih");
+	// GCN 2: the CIK IH (OSS 2.0) is reached through the translation, but its enable bits differ from Tonga's (IH_CNTL
+	// ENABLE_INTR, as on CZ); keep it off until that is handled. -crgcn2ih lets Apple's enable through.
+	bool gcn2 = isGcn2(callback->family);
+	bool off = enable && (checkKernelArgument("-crnoih") || (gcn2 && !checkKernelArgument("-crgcn2ih")));
 	ihEnableCalls++;
 	ihLastEnable = enable && !off;
 	ihManager = that;
@@ -8644,7 +8783,7 @@ void CRDriver::wrapIhSetHardwareEnabled(void *that, bool enable) {
 		__atomic_store_n(&ihStormBroken, false, __ATOMIC_RELAXED);
 		diskLogEvent("ih storm breaker re-armed on IH enable");
 	}
-	if (gpuMmio && !checkKernelArgument("-crnoihfix")) {
+	if (gpuMmio && !gcn2 && !checkKernelArgument("-crnoihfix")) {
 		uint32_t cntl = gpuMmio[IhReg::CNTL];
 		if (enable && !off)
 			cntl |= IhCntlEnableIntr | IhCntlRptrRearm;
@@ -8666,6 +8805,11 @@ void CRDriver::wrapIhHandler(void *that, void *owner, void *arg, void *nub, int 
 	uint32_t calls = __atomic_add_fetch(&ihHandlerCalls, 1, __ATOMIC_RELAXED);
 	if (ihStormBroken)
 		return;
+	// GCN 2: the storm breaker reads and writes VI IH offsets directly.
+	if (isGcn2(callback->family)) {
+		FunctionCast(wrapIhHandler, callback->orgIhHandler)(that, owner, arg, nub, source);
+		return;
+	}
 	uint64_t ms = uptimeMs();
 	if (ms - ihWindowStart > 100) {
 		ihWindowStart = ms;
@@ -9980,7 +10124,7 @@ uint32_t CRDriver::wrapGetDisplayLimit(void *) { return displayPipes(callback->f
 
 uint8_t CRDriver::wrapGetNumLineBuffers(void *) { return displayPipes(callback->family); }
 
-uint32_t CRDriver::wrapGetDigLimit(void *) { return DisplayDigs; }
+uint32_t CRDriver::wrapGetDigLimit(void *) { return isGcn2(callback->family) ? 6 : DisplayDigs; }
 
 void CRDriver::logPCIInfo() {
 	revision = static_cast<uint8_t>(WIOKit::readPCIConfigValue(iGPU, WIOKit::kIOPCIConfigRevisionID));
