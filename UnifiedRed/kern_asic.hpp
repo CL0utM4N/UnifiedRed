@@ -2,7 +2,7 @@
 //  kern_asic.hpp
 //  UnifiedRed
 //
-//  Hardware constants for Carrizo-family (GFX8 / VI) APUs.
+//  Hardware constants for Carrizo-family (GFX8 / VI) APUs, and detection of the GCN 2 ones (GFX7 / CIK).
 //  Register offsets are dword indices into the MMIO BAR (BAR5), as in Linux's
 //  drivers/gpu/drm/amd/include/asic_reg headers (MIT licensed).
 //
@@ -17,7 +17,13 @@ enum class ChipFamily {
 	Unknown,
 	Carrizo,  // Carrizo and Bristol Ridge: gfx801, DCE 11.0, 8 CUs max
 	Stoney,   // Stoney Ridge: gfx810, DCE 11.0, 3 CUs, single pipe-set
+	// GCN 2 (docs/OLDER_APUS.md). Detected and observed only: every Carrizo/Stoney fix stays off for them, and Apple's
+	// drivers need the GCN 2 remaps before they can attach.
+	Kaveri,   // Kaveri, incl. Godavari-era desktop refreshes: gfx700, DCE 8.1, up to 8 CUs
+	Kabini,   // Kabini and Beema/Mullins: gfx703 (16 LDS banks), DCE 8.3, 2 CUs
 };
+
+inline bool isGcn2(ChipFamily family) { return family == ChipFamily::Kaveri || family == ChipFamily::Kabini; }
 
 struct SupportedDevice {
 	uint16_t deviceId;
@@ -33,12 +39,38 @@ static constexpr SupportedDevice SupportedDevices[] {
 	{0x9876, ChipFamily::Carrizo},
 	{0x9877, ChipFamily::Carrizo},
 	{0x98E4, ChipFamily::Stoney},
+	// amdgpu_drv.c CHIP_KAVERI, CHIP_KABINI, CHIP_MULLINS (CIK, AMD_IS_APU).
+	{0x1304, ChipFamily::Kaveri},
+	{0x1305, ChipFamily::Kaveri},
+	{0x1306, ChipFamily::Kaveri},
+	{0x1307, ChipFamily::Kaveri},
+	{0x1309, ChipFamily::Kaveri},
+	{0x130A, ChipFamily::Kaveri},
+	{0x130B, ChipFamily::Kaveri},
+	{0x130C, ChipFamily::Kaveri},
+	{0x130D, ChipFamily::Kaveri},
+	{0x130E, ChipFamily::Kaveri},
+	{0x130F, ChipFamily::Kaveri},
+	{0x1310, ChipFamily::Kaveri},
+	{0x1311, ChipFamily::Kaveri},
+	{0x1312, ChipFamily::Kaveri},
+	{0x1313, ChipFamily::Kaveri},
+	{0x1315, ChipFamily::Kaveri},
+	{0x1316, ChipFamily::Kaveri},
+	{0x1317, ChipFamily::Kaveri},
+	{0x1318, ChipFamily::Kaveri},
+	{0x131B, ChipFamily::Kaveri},
+	{0x131C, ChipFamily::Kaveri},
+	{0x131D, ChipFamily::Kaveri},
 };
 
 inline ChipFamily familyForDevice(uint16_t deviceId) {
 	for (auto &dev : SupportedDevices)
 		if (dev.deviceId == deviceId)
 			return dev.family;
+	// CHIP_KABINI 0x9830-0x983F, CHIP_MULLINS 0x9850-0x985F: every ID in both ranges.
+	if ((deviceId & 0xFFF0) == 0x9830 || (deviceId & 0xFFF0) == 0x9850)
+		return ChipFamily::Kabini;
 	return ChipFamily::Unknown;
 }
 
@@ -49,6 +81,10 @@ inline uint8_t displayPipes(ChipFamily family) {
 		case ChipFamily::Carrizo:
 			return 3;
 		case ChipFamily::Stoney:
+			return 2;
+		case ChipFamily::Kaveri:  // Linux dce_v8_0_early_init: num_crtc 4 (Kaveri), 2 (Kabini, Mullins)
+			return 4;
+		case ChipFamily::Kabini:
 			return 2;
 		default:
 			return 0;
@@ -78,6 +114,10 @@ inline const char *familyName(ChipFamily family) {
 			return "Carrizo/Bristol Ridge";
 		case ChipFamily::Stoney:
 			return "Stoney Ridge";
+		case ChipFamily::Kaveri:
+			return "Kaveri (GCN 2)";
+		case ChipFamily::Kabini:
+			return "Kabini/Mullins (GCN 2)";
 		default:
 			return "Unknown";
 	}

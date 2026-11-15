@@ -1,4 +1,4 @@
-# Test machine
+# Test machines (GCN 2)
 
 ## HP laptop, AMD A4-5000 (Kabini)
 
@@ -135,3 +135,33 @@ GPU comes up fully (kabini microcode, 512 MB VRAM).
   `_machine_idle` in Recovery.) What fits every run: one CPU stuck with interrupts off, so the timers queued on it
   never fire and the threads waiting on them never wake. Next test: `krprobepanic=30`, a deliberate panic from the
   probe (alive through the freeze); on the way into the debugger XNU names CPUs that don't answer its IPI.
+
+## MSI A78M-E35 V2 desktop, AMD A6-7400K (Kaveri), from 2026-11-15
+
+The first Kaveri machine. Steamroller is family 15h, so it should boot on the same AMD_Vanilla path as the Excavator
+laptops, which the Kabini (Jaguar) boot freeze above can't.
+
+| | |
+|---|---|
+| CPU | A6-7400K: 2 × Steamroller, 3.5 GHz (family 15h model 30h stepping 1). AVX, FMA, SSE4.2, F16C, BMI1, XSAVEOPT; **no AVX2, BMI2 or RDRAND**: Ventura and later need CryptexFixup and the plain `x86_64` dyld cache; `HfsPlusLegacy.efi` |
+| GPU | Radeon R5: **1002:1315 rev 0x00**, subsystem 1462:7721; GCN 2 gfx700, DCE 8.1. Linux (`radeon`, 6.17): kaveri microcode, all 8 rings and IB tests pass, UVD 1.64, VCE 40.2.2, DPM on, MSI |
+| Board, firmware | MSI A78M-E35 V2 (MS-7721), AMI BIOS **V6.5 (2016-08-10)**, UEFI 2.3.1, no Memory Attributes Table |
+| Memory | 16 GB DDR3, 128-bit; **1 GB carve-out**, which with 16 GB installed lies above 4 GB physical (usable RAM ends at `0x43EFFFFFF`) |
+| GPU BARs | BAR0 256 MB at `0xC0000000` (smaller than the carve-out), doorbells 8 MB at `0xD0000000`, MMIO (BAR5) 256 KB at `0xFEB00000`, ROM at `0xC0000` |
+| **No ACPI VFCT table** | the VBIOS (62,976 bytes, subsystem 1462:7721) is only in the legacy ROM shadow: UnifiedRed needs KaberiRed's `VBIOS::injectFromShadow` fallback |
+| VBIOS tables | every command table Apple's AMDSupport uses is at a revision it handles: DIGxEncoderControl 1.4, DIG1TransmitterControl 1.5, SelectCRTC_Source 1.2, SetPixelClock 1.6, AdjustDisplayPll 1.3, EnableSpreadSpectrumOnPPLL 1.3, ProcessAuxChannelTransaction 1.2 (Apple: 4–5, 5–6, 2–3, 5–7, 3, 3, 2) |
+| Displays | DVI-D (UNIPHY2, HPD3), HDMI (UNIPHY, HPD1), VGA through a **NUTMEG DP-to-VGA bridge** on UNIPHY3 (ExternalEncoderControl 2.3, which Apple never calls: VGA is not expected to work). Use HDMI or DVI |
+| ACPI | no EC; GPU node `\_SB.PCI0.VGA`; LPC `\_SB.PCI0.SBRG`; `HPET._STA` switches the HPET off unless `_OSI` answers Windows 2006 or later (`SSDT-XOSI-A78M`); IVRS (AMD IOMMU) present; no `_UPC`, so no USB map from ACPI |
+| Other devices | FCH xHCI 1022:7814 ×2 (00:10.0, 00:10.1), EHCI/OHCI 1022:7808/7807/7809, SATA AHCI 1022:7801, HD Audio 1022:780D, HDMI audio 1002:1308, Realtek RTL8111 Ethernet 10EC:8168 |
+
+Linux dump: `CarrizoRed-RE/EFI/MSI A78M-E35 V2 (A6-7400K)/` (its decompiled ACPI tables in `Support files/acpi-dsl/`).
+The register dump is missing (neither `umr` nor amdgpu's debugfs: the live session ran `radeon`); UnifiedRed's first
+report fills it in.
+
+EFI: `python scripts/build_efi_a78m.py "<machine folder>/Support files/efi-build" --fchxhcifix`: macOS Sequoia,
+iMac19,1, 2 cores, Lilu, VirtualSMC, RestrictEvents, CryptexFixup, RealtekRTL8111, VoodooPS2 (keyboard), FCHXHCIFix
+(matched to 7814), SSDT-EC-USBX, SSDT-XOSI-A78M, the iGPU's `vendor-id` overridden so Apple's AMDSupport leaves it
+alone. BIOS: IOMMU off, Secure Boot off, CSM off. Install from a **USB 2.0 port** (EHCI, native) and over Ethernet.
+
+### Install log
+- (none yet)

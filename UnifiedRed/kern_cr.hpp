@@ -139,6 +139,8 @@ private:
 
 	void startWatcher();
 	static void watcherThread(void *arg, wait_result_t);
+	void gcn2Watch();
+	const char *composeReportGcn2(uint32_t t, const char *tree);
 
 	void findByConfigSpace();
 	void logPCIInfo();

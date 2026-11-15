@@ -341,6 +341,19 @@ Details are in [gcn2/TEST_MACHINES.md](gcn2/TEST_MACHINES.md).
 - 4 tile pipes and 2 render backends, closer to what Metal already handles;
 - a PCIe slot for a second GPU or a serial card while debugging.
 
+**Since 2026-11-15 there is one:** an MSI A78M-E35 V2 desktop with an A6-7400K (1002:1315), details in
+[gcn2/TEST_MACHINES.md](gcn2/TEST_MACHINES.md) and its EFI from `scripts/build_efi_a78m.py`. From its Linux dump:
+- no VFCT table, so UnifiedRed now falls back to the legacy ROM shadow at 0xC0000 (KaberiRed's `injectFromShadow`);
+- every VBIOS command table Apple's AMDSupport calls is at a revision it handles (encoder 1.4, transmitter 1.5,
+  CRTC source 1.2, pixel clock 1.6);
+- VGA goes through a NUTMEG DP-to-VGA bridge (ExternalEncoderControl, which Apple never calls), so DVI and HDMI are
+  the outputs to use;
+- with 16 GB installed, the 1 GB carve-out lies above 4 GB physical.
+
+UnifiedRed now detects the GCN 2 IDs (`ChipFamily::Kaveri`, `ChipFamily::Kabini`) and observes only: every Carrizo/Stoney
+fix stays off, the watcher starts at detection so `crpanicat` gives a report, and the DCE 11 underflow sampler (which
+writes registers) stays off.
+
 ## Plan
 
 1. **Hardware that boots.** Either Kabini past the freeze (`krprobepanic`), or a Kaveri machine. Collect the Linux

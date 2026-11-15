@@ -66,10 +66,17 @@ namespace VBIOS {
 	/**
 	 *  Find the VBIOS for `pci` in the ACPI VFCT table and publish it as "ATY,bin_image".
 	 *  Does nothing if the property already exists (e.g. injected through OpenCore DeviceProperties).
+	 *  Without a VFCT table, falls back to injectFromShadow().
 	 *
 	 *  @return true if the property is present afterwards
 	 */
 	bool inject(IOPCIDevice *pci, uint16_t vendorId, uint16_t deviceId);
+
+	/**
+	 *  Fallback when there's no VFCT: the boot GPU's option ROM as shadowed at the legacy VGA ROM address (0xC0000),
+	 *  accepted only if it's an ATOM BIOS whose PCI data structure names this vendor and device.
+	 */
+	bool injectFromShadow(IOPCIDevice *pci, uint16_t vendorId, uint16_t deviceId);
 
 	// ATOM master data table indices (atombios.h ATOM_MASTER_LIST_OF_DATA_TABLES).
 	static constexpr uint32_t PowerPlayInfoTable = 15;

@@ -1514,6 +1514,14 @@ void CRDriver::processPatcher(KernelPatcher &patcher) {
 	}
 	keepVbiosImage(iGPU);
 	setSoftPowerPlayTable();
+
+	// GCN 2 (docs/OLDER_APUS.md, plan step 2): observation only. Apple's Polaris drivers can't drive DCE 8 / GFX7 yet,
+	// so the EFI keeps them off the iGPU and the watcher, which normally starts with AMD9500Controller, starts here:
+	// it gives the report (crpanicat) with the PCI info, carve-out, GB_ADDR_CONFIG and the VBIOS source.
+	if (isGcn2(family)) {
+		SYSLOG("cr", "%s: observation only, Apple's drivers stay off", familyName(family));
+		startWatcher();
+	}
 }
 
 // PowerPlay's table parser (HWLibs PP_Tables_Initialize) gets its table from the PP_PhmSoftPowerPlayTable registry key,
@@ -3257,6 +3265,20 @@ void CRDriver::wakeWatchdogFired(const char *when, bool notPoweredOn, uint32_t b
 }
 
 void CRDriver::startWatcher() {
+	// Once: GCN 2 starts it at detection, and AMD9500Controller would start it again if a spoof let it load.
+	static bool started;
+	if (started)
+		return;
+	started = true;
+	// GCN 2: the sleep/wake handler saves and restores DCE 11 panel and BIOS-scratch registers; observation only for now.
+	if (isGcn2(family)) {
+		thread_t thread;
+		if (kernel_thread_start(watcherThread, this, &thread) == KERN_SUCCESS)
+			thread_deallocate(thread);
+		else
+			SYSLOG("cr", "failed to start the registry watcher");
+		return;
+	}
 	if (!checkKernelArgument("-crnowakepanic")) {
 		wakeWatchdogCall = thread_call_allocate(wakeWatchdog, nullptr);
 		sleepWatchdogCall = thread_call_allocate(sleepWatchdog, nullptr);
@@ -3990,8 +4012,217 @@ static void diskLogTick(uint32_t t, uint32_t stallTicks) {
 		diskLogStarted = true;
 }
 
+// GCN 2 (Kaveri, Kabini/Mullins): the watcher's own loop and report. Everything in the Carrizo/Stoney watcher reads,
+// and some of it writes, DCE 11 / SMU 8 / VCN registers whose offsets are other registers on DCE 8 / SMU 7 (CIK), so
+// none of it runs here. Reads only: the memory controller, GFX config, and the display state the firmware (GOP) left,
+// so the DCE 8 work knows which pipe, surface and encoder light the monitor. DCE 8 offsets from Linux dce_8_0_d.h.
+namespace Dce8 {
+	// CRTC/GRPH/LB/DIG register blocks: +0x300 per pipe for 0-1, 0x2600 + 0x300 * (n - 2) after.
+	static constexpr uint32_t BlockOffset[] {0x0, 0x300, 0x2600, 0x2900, 0x2C00, 0x2F00, 0x3200};
+	static constexpr uint32_t VGA_RENDER_CONTROL = 0xC0, D1VGA_CONTROL = 0xCC, D2VGA_CONTROL = 0xCE;
+	static constexpr uint32_t CRTC0_PIXEL_RATE_CNTL = 0x140;  // +4 per CRTC
+	static constexpr uint32_t DMIF_CONTROL = 0x2F6, DMIF_STATUS = 0x2F7, DCI_CLK_CNTL = 0x31E;
+	static constexpr uint32_t PIPE0_PG_STATUS = 0x1762;  // +4 per pipe; [31:30] PGFSM_PWR_STATUS, 0 = powered
+	static constexpr uint32_t DC_HPD1_INT_STATUS = 0x1807;  // +3 per HPD; [1] DC_HPD1_SENSE
+	static constexpr uint32_t DAC_ENABLE = 0x19E4, DAC_SOURCE_SELECT = 0x19E5;
+	static constexpr uint32_t GRPH_ENABLE = 0x1A00, GRPH_CONTROL = 0x1A01, GRPH_PRIMARY_SURFACE_ADDRESS = 0x1A04,
+		GRPH_PITCH = 0x1A06, GRPH_PRIMARY_SURFACE_ADDRESS_HIGH = 0x1A07, GRPH_X_END = 0x1A0D, GRPH_Y_END = 0x1A0E;
+	static constexpr uint32_t LB_DATA_FORMAT = 0x1AC0;
+	static constexpr uint32_t CRTC_H_TOTAL = 0x1B80, CRTC_H_BLANK_START_END = 0x1B81, CRTC_V_TOTAL = 0x1B87,
+		CRTC_V_BLANK_START_END = 0x1B8D, CRTC_CONTROL = 0x1B9C, CRTC_STATUS_POSITION = 0x1BA4;
+	static constexpr uint32_t DIG_FE_CNTL = 0x1C00, HDMI_CONTROL = 0x1C0C, DIG_BE_CNTL = 0x1C50, DIG_BE_EN_CNTL = 0x1C51,
+		DP_LINK_CNTL = 0x1CC0, DP_VID_STREAM_CNTL = 0x1CC3;
+	// Linux dce_v8_0_early_init: Kaveri 4 CRTCs, 7 DIGs; Kabini/Mullins 2 CRTCs, 6 DIGs; 6 HPD pins on both.
+	static inline uint32_t digs(ChipFamily family) { return family == ChipFamily::Kaveri ? 7 : 6; }
+}
+
+static bool gcn2PipePowered(volatile uint32_t *m, uint32_t pipe) { return !(m[Dce8::PIPE0_PG_STATUS + 4 * pipe] >> 30); }
+
+// The display state in one paragraph: active CRTCs with their timing and surface, enabled DIGs with their source, HPD
+// sense, DAC. "raw" adds every register read, for the report.
+static size_t gcn2DisplayState(ChipFamily family, char *buf, size_t size, bool raw) {
+	using namespace Dce8;
+	size_t len = 0;
+	auto add = [&](const char *fmt, ...) {
+		if (len + 1 >= size)
+			return;
+		va_list va;
+		va_start(va, fmt);
+		int n = vsnprintf(buf + len, size - len, fmt, va);
+		va_end(va);
+		if (n > 0)
+			len += static_cast<size_t>(n) < size - len ? static_cast<size_t>(n) : size - len - 1;
+	};
+	buf[0] = '\0';
+	auto *m = gpuMmio;
+	if (!m)
+		return 0;
+	add("vga render %x d1 %x d2 %x; dmif %x/%x dci clk %x; hpd sense", m[VGA_RENDER_CONTROL], m[D1VGA_CONTROL],
+		m[D2VGA_CONTROL], m[DMIF_CONTROL], m[DMIF_STATUS], m[DCI_CLK_CNTL]);
+	for (uint32_t i = 0; i < 6; i++)
+		add("%s", (m[DC_HPD1_INT_STATUS + 3 * i] & 2) ? " 1" : " 0");
+	add("; dac %x src %x\n", m[DAC_ENABLE], m[DAC_SOURCE_SELECT]);
+	for (uint32_t pipe = 0; pipe < displayPipes(family); pipe++) {
+		uint32_t pg = m[PIPE0_PG_STATUS + 4 * pipe];
+		if (!gcn2PipePowered(m, pipe)) {
+			if (raw)
+				add("pipe%u gated (pg %x)\n", pipe, pg);
+			continue;
+		}
+		uint32_t o = BlockOffset[pipe], ctl = m[CRTC_CONTROL + o], grph = m[GRPH_ENABLE + o];
+		if (!(ctl & 1) && !raw)
+			continue;
+		add("crtc%u %s ctl %x: total %ux%u, hblank %x vblank %x, pos %x, rate %x; grph %s ctl %x at %x:%08x pitch %u "
+			"end %ux%u, lb fmt %x\n", pipe, (ctl & 1) ? "on" : "off", ctl, (m[CRTC_H_TOTAL + o] & 0x3FFF) + 1,
+			(m[CRTC_V_TOTAL + o] & 0x3FFF) + 1, m[CRTC_H_BLANK_START_END + o], m[CRTC_V_BLANK_START_END + o],
+			m[CRTC_STATUS_POSITION + o], m[CRTC0_PIXEL_RATE_CNTL + 4 * pipe], (grph & 1) ? "on" : "off", m[GRPH_CONTROL + o],
+			m[GRPH_PRIMARY_SURFACE_ADDRESS_HIGH + o], m[GRPH_PRIMARY_SURFACE_ADDRESS + o], m[GRPH_PITCH + o],
+			m[GRPH_X_END + o], m[GRPH_Y_END + o], m[LB_DATA_FORMAT + o]);
+	}
+	for (uint32_t dig = 0; dig < digs(family); dig++) {
+		uint32_t o = BlockOffset[dig], en = m[DIG_BE_EN_CNTL + o];
+		if (!(en & 1) && !raw)
+			continue;
+		add("dig%u %s: fe %x be %x hdmi %x dp link %x stream %x\n", dig, (en & 1) ? "on" : "off", m[DIG_FE_CNTL + o],
+			m[DIG_BE_CNTL + o], m[HDMI_CONTROL + o], m[DP_LINK_CNTL + o], m[DP_VID_STREAM_CNTL + o]);
+	}
+	return len;
+}
+
+const char *CRDriver::composeReportGcn2(uint32_t t, const char *tree) {
+	static char report[8192];
+	size_t len = 0;
+	auto add = [&](const char *fmt, ...) {
+		if (len + 1 >= sizeof(report))
+			return;
+		va_list va;
+		va_start(va, fmt);
+		int n = vsnprintf(report + len, sizeof(report) - len, fmt, va);
+		va_end(va);
+		if (n > 0)
+			len += static_cast<size_t>(n) < sizeof(report) - len ? static_cast<size_t>(n) : sizeof(report) - len - 1;
+	};
+	report[0] = '\0';
+	add("UnifiedRed " xStringify(MODULE_VERSION) " (%s, %s) t=%us, %s %04x rev %x, kernel %d.%d\n", xStringify(CR_COMMIT),
+		CR_BUILD_KIND, t, familyName(family), deviceId, revision, getKernelVersion(), getKernelMinorVersion());
+	if (iGPU)
+		add("pci %04x:%04x cmd %x status %x bar0 %x bar2 %x bar5 %x; mmio phys %llx mapped at %llu ms (method %u, "
+			"failures %u)\n", iGPU->configRead16(kIOPCIConfigVendorID), iGPU->configRead16(kIOPCIConfigDeviceID),
+			iGPU->configRead16(kIOPCIConfigCommand), iGPU->configRead16(kIOPCIConfigStatus),
+			iGPU->configRead32(kIOPCIConfigBaseAddress0), iGPU->configRead32(kIOPCIConfigBaseAddress2),
+			iGPU->configRead32(kIOPCIConfigBaseAddress5), probePhys, probeMs, mmioMapMethod, mmioMapFailures);
+	if (auto *m = gpuMmio) {
+		// gmc_7_1 / bif_4_1 / oss_2_0 / gfx_7_0: the same offsets as on VI for all of these.
+		uint32_t memSize = m[Reg::CONFIG_MEMSIZE], fbLoc = m[Reg::MC_VM_FB_LOCATION], fbOff = m[Reg::MC_VM_FB_OFFSET];
+		add("mc: memsize %x (%u MB), fb location %x (MC %llx-%llx), fb offset %x -> carve-out at system %llx; "
+			"aperture %x-%x, agp %x-%x base %x, hdp nonsurface %x size %x, aper size %x, ramcfg %x\n", memSize,
+			memSize & 0xFFFF, fbLoc, static_cast<uint64_t>(fbLoc & 0xFFFF) << 24,
+			(static_cast<uint64_t>(fbLoc >> 16) << 24) | 0xFFFFFF, fbOff, static_cast<uint64_t>(fbOff & 0x3FFFF) << 22,
+			m[Reg::MC_VM_SYSTEM_APERTURE_LOW_ADDR], m[Reg::MC_VM_SYSTEM_APERTURE_HIGH_ADDR], m[0x80B], m[0x80A], m[0x80C],
+			m[Reg::HDP_NONSURFACE_BASE], m[Reg::HDP_NONSURFACE_SIZE], m[0x150C], m[0x9D8]);
+		add("gfx: grbm %x/%x, gb addr config %x, shader array config %x, rb backend disable %x\n", m[Reg::GRBM_STATUS],
+			m[0x2002], m[Reg::GB_ADDR_CONFIG], m[Reg::CC_GC_SHADER_ARRAY_CONFIG], m[Reg::CC_RB_BACKEND_DISABLE]);
+		static char display[2048];
+		gcn2DisplayState(family, display, sizeof(display), true);
+		add("display (DCE 8):\n%s", display);
+	} else {
+		add("no MMIO mapping\n");
+	}
+	if (iGPU) {
+		auto *status = OSDynamicCast(OSString, iGPU->getProperty("UnifiedRed,vbios-status"));
+		auto *image = OSDynamicCast(OSData, iGPU->getProperty(VBIOS::ImageProperty));
+		auto *dev = OSDynamicCast(OSData, iGPU->getProperty("device-id"));
+		add("vbios: %s, %s %u bytes; device-id property %x\n", status ? status->getCStringNoCopy() : "no status",
+			VBIOS::ImageProperty, image ? image->getLength() : 0,
+			dev && dev->getLength() >= 2 ? *static_cast<const uint16_t *>(dev->getBytesNoCopy()) : 0);
+	}
+	add("events:");
+	for (uint32_t i = 0; i < arrsize(diskLogRecent); i++) {
+		auto &line = diskLogRecent[(diskLogRecentNext + i) % arrsize(diskLogRecent)];
+		if (line[0])
+			add(" | %s", line);
+	}
+	add("\ntree:\n%s", tree ? tree : "");
+	add("\ndisk log: %s, %u writes, %u errors (last %d)\n", diskLogPath[0] ? diskLogPath : "not started", diskLogWrites,
+		diskLogErrors, diskLogLastError);
+	return report;
+}
+
+void CRDriver::gcn2Watch() {
+	static char now[1536], last[1536], display[1024], lastDisplay[1024];
+	diskLogOff = checkKernelArgument("-crnodisklog");
+	bool controllerRequested = checkKernelArgument("-crnoloadctl");
+	uint32_t panicAt = 0, printed = 0;
+	if (!PE_parse_boot_argn("crpanicat", &panicAt, sizeof(panicAt)))
+		panicAt = 0;
+	for (uint32_t tick = 0, t = 0;; tick++, t = tick / 2) {
+		watcherBeat++;
+		mirrorKernelLog();
+		if (!gpuMmio)
+			probeMMIO();
+		// Trace events from the wrappers (only with the Polaris spoof, once Apple's drivers run).
+		uint32_t head = __atomic_load_n(&traceHead, __ATOMIC_RELAXED);
+		if (head - printed > TraceRingSize)
+			printed = head - static_cast<uint32_t>(TraceRingSize);
+		for (; printed != head; printed++) {
+			auto &event = traceRing[printed % TraceRingSize];
+			if (event.exit)
+				IOLog("UnifiedRed: <- %s = 0x%x\n", event.name, event.value);
+			else
+				IOLog("UnifiedRed: -> %s\n", event.name);
+		}
+		// Display state changes: the firmware's mode at first, then whatever Apple's controller does to it.
+		if (gpuMmio && !__atomic_load_n(&gpuSleeping, __ATOMIC_RELAXED)) {
+			gcn2DisplayState(family, display, sizeof(display), false);
+			if (strcmp(display, lastDisplay)) {
+				strlcpy(lastDisplay, display, sizeof(lastDisplay));
+				IOLog("UnifiedRed: t=%us DCE 8 display state:\n%s", t, display);
+				diskLogEvent("DCE 8 display at t=%u: %s", t, display);
+				iGPU->setProperty("UnifiedRed,gcn2-display", display);
+			}
+		}
+		diskLogTick(t, 0);
+		if (panicAt && t >= panicAt) {
+			const char *report = composeReportGcn2(t, now);
+			diskLogEvent("panic: crpanicat; report follows");
+			diskLogTick(t, 0);
+			diskLogAppend(report, strlen(report));
+			diskLogAppend("\n", 1);
+			panic("UnifiedRed: deliberate panic (crpanicat), the kernel was still running.\n%s", report);
+		}
+		if (tick % 2) {
+			IOSleep(500);
+			continue;
+		}
+		now[0] = '\0';
+		describeChildren(iGPU, 0, now, sizeof(now));
+		// With the Polaris spoof: ask for AMD9500Controller as on Carrizo (see watcherThread), never for acceleration.
+		if (!controllerRequested && strstr(now, "AMD9500ControllerWrangler")) {
+			controllerRequested = true;
+			if (!iGPU->getProperty("LoadController")) {
+				iGPU->setProperty("LoadAMDSupport", true);
+				iGPU->setProperty("LoadController", true);
+				iGPU->registerService();
+				IOLog("UnifiedRed: t=%us set LoadController on the iGPU and re-registered it\n", t);
+			}
+		}
+		if (strcmp(now, last) || t % 15 == 0) {
+			strlcpy(last, now, sizeof(last));
+			iGPU->setProperty("UnifiedRed,tree", now);
+			IOLog("UnifiedRed: t=%us iGPU children:%s\n", t, now[0] ? "" : " none");
+			if (now[0])
+				IOLog("%s", now);
+		}
+		IOSleep(500);
+	}
+}
+
 void CRDriver::watcherThread(void *arg, wait_result_t) {
 	auto *self = static_cast<CRDriver *>(arg);
+	if (isGcn2(self->family)) {
+		self->gcn2Watch();
+		return;
+	}
 	static char last[1536], now[1536];
 	bool print = !checkKernelArgument("-crnowatch");
 	bool watchdog = !checkKernelArgument("-crnowatchdog");
@@ -4118,7 +4349,8 @@ void CRDriver::watcherThread(void *arg, wait_result_t) {
 				__atomic_load_n(&pipeAccesses, __ATOMIC_RELAXED), __atomic_load_n(&pmEvents, __ATOMIC_RELAXED),
 				__atomic_load_n(&pciConfigWrites, __ATOMIC_RELAXED));
 
-		if (gpuMmio)
+		// DCE 11 registers, and it writes two of them: on DCE 8 (GCN 2) those offsets are other registers.
+		if (gpuMmio && !isGcn2(self->family))
 			underflowTick();
 		if (restoreOn && gpuMmio)
 			restoreTick(t);
@@ -9768,7 +10000,7 @@ void CRDriver::probeMMIO() {
 	probeValues[2] = fbOffset;
 	probeValues[3] = grbmStatus;
 	probeMs = uptimeMs();
-	if (!uvdAtProbe.taken && !gpuRegistersDead(mmio) && checkKernelArgument("-crvideo"))
+	if (!uvdAtProbe.taken && !isGcn2(family) && !gpuRegistersDead(mmio) && checkKernelArgument("-crvideo"))
 		uvdSnapshot(uvdAtProbe);
 	if (gpuRegistersDead(mmio)) {
 		gpuDeadAtStart = true;
@@ -9797,6 +10029,15 @@ void CRDriver::probeMMIO() {
 	iGPU->setProperty("UnifiedRed,carveout-phys", carveoutPhys, 64);
 	iGPU->setProperty("UnifiedRed,gb-addr-config", gbAddrConfig, 32);
 
+	// GCN 2: initDisplayRegs and relocateFb work on DCE 11 / the accelerator's memory layout. Log what the firmware
+	// left on the display instead.
+	if (isGcn2(family)) {
+		static char display[1024];
+		gcn2DisplayState(family, display, sizeof(display), false);
+		SYSLOG("cr", "DCE 8 display state at start-up: %s", display);
+		iGPU->setProperty("UnifiedRed,gcn2-display", display);
+		return;
+	}
 	initDisplayRegs();
 	relocateFb();
 }
@@ -13762,6 +14003,8 @@ void CRDriver::panicReport(uint32_t t, const char *tree, const char *reason) {
 }
 
 const char *CRDriver::composeReport(uint32_t t, const char *tree) {
+	if (isGcn2(family))
+		return composeReportGcn2(t, tree);
 	// 32 KB: the disk log takes all of it (Catalina wake #8: the display sections of the post-wake report were cut off
 	// at 8 KB, inside the registry tree); a panic keeps what fits.
 	static char report[32768];
