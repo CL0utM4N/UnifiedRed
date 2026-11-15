@@ -269,6 +269,18 @@ static mach_vm_address_t atomReadFn, atomReadEnd, atomWriteFn, atomWriteEnd, baf
 static uint32_t dce8Moved, dce8Dropped, dce8DroppedWrites, dce8Atom, dce8LbFixes;
 static uint8_t dce8DroppedSeen[0x10000 / 8];
 static uint32_t dce8DroppedFirst[48], dce8DroppedFirstCount;
+// GCN 2: the top of the carve-out kept from Apple's drivers (CONFIG_MEMSIZE reads Gcn2ReserveMb less through both
+// translated register paths) for what has to live in VRAM, the IH ring first (see moveIhRing). CAIL reads the register
+// through its own mapping and sees the real size.
+static constexpr uint32_t Gcn2ReserveMb = 16;
+static uint32_t gcn2MemMb, gcn2MemSizeFixes;
+static uint64_t gcn2ReservePhys;
+static bool gcn2Gpu;  // the iGPU is a GCN 2 APU (set at detection; for code that runs before `callback` is usable)
+static bool dce8Translate(uint32_t &byteOffset, bool write, uint32_t value, mach_vm_address_t ra);
+static uint32_t gcn2MemSizeRead(uint32_t dword, uint32_t value);
+static uint32_t gcn2MemSizeWrite(uint32_t dword, uint32_t value);
+// Tonga's IH_RB_CNTL / IH_CNTL as Apple last wrote them (see ihTongaWrite).
+static uint32_t ihTongaRbCntl, ihTongaCntl, ihTongaWrites;
 // A small leaf function's end: the first "pop rbp; ret" (these accessors keep frame pointers), else 0x80 bytes.
 static mach_vm_address_t functionEnd(mach_vm_address_t start) {
 	auto *code = reinterpret_cast<const uint8_t *>(start);
@@ -1510,6 +1522,7 @@ void CRDriver::processPatcher(KernelPatcher &patcher) {
 	if (family != ChipFamily::Stoney)
 		pagePatches[0].enabled = false;
 	pipeLimit = displayPipes(family);
+	gcn2Gpu = isGcn2(family);
 	pipeGuard = checkKernelArgument("-crpipeguard");
 	regLogIntsOff = checkKernelArgument("-crreglogintsoff");
 	regLogAll = checkKernelArgument("-crreglogall");
@@ -4182,69 +4195,6 @@ static size_t gcn2DisplayState(ChipFamily family, char *buf, size_t size, bool r
 	return len;
 }
 
-const char *CRDriver::composeReportGcn2(uint32_t t, const char *tree) {
-	static char report[8192];
-	size_t len = 0;
-	auto add = [&](const char *fmt, ...) {
-		if (len + 1 >= sizeof(report))
-			return;
-		va_list va;
-		va_start(va, fmt);
-		int n = vsnprintf(report + len, sizeof(report) - len, fmt, va);
-		va_end(va);
-		if (n > 0)
-			len += static_cast<size_t>(n) < sizeof(report) - len ? static_cast<size_t>(n) : sizeof(report) - len - 1;
-	};
-	report[0] = '\0';
-	add("UnifiedRed " xStringify(MODULE_VERSION) " (%s, %s) t=%us, %s %04x rev %x, kernel %d.%d\n", xStringify(CR_COMMIT),
-		CR_BUILD_KIND, t, familyName(family), deviceId, revision, getKernelVersion(), getKernelMinorVersion());
-	if (iGPU)
-		add("pci %04x:%04x cmd %x status %x bar0 %x bar2 %x bar5 %x; mmio phys %llx mapped at %llu ms (method %u, "
-			"failures %u)\n", iGPU->configRead16(kIOPCIConfigVendorID), iGPU->configRead16(kIOPCIConfigDeviceID),
-			iGPU->configRead16(kIOPCIConfigCommand), iGPU->configRead16(kIOPCIConfigStatus),
-			iGPU->configRead32(kIOPCIConfigBaseAddress0), iGPU->configRead32(kIOPCIConfigBaseAddress2),
-			iGPU->configRead32(kIOPCIConfigBaseAddress5), probePhys, probeMs, mmioMapMethod, mmioMapFailures);
-	if (auto *m = gpuMmio) {
-		// gmc_7_1 / bif_4_1 / oss_2_0 / gfx_7_0: the same offsets as on VI for all of these.
-		uint32_t memSize = m[Reg::CONFIG_MEMSIZE], fbLoc = m[Reg::MC_VM_FB_LOCATION], fbOff = m[Reg::MC_VM_FB_OFFSET];
-		add("mc: memsize %x (%u MB), fb location %x (MC %llx-%llx), fb offset %x -> carve-out at system %llx; "
-			"aperture %x-%x, agp %x-%x base %x, hdp nonsurface %x size %x, aper size %x, ramcfg %x\n", memSize,
-			memSize & 0xFFFF, fbLoc, static_cast<uint64_t>(fbLoc & 0xFFFF) << 24,
-			(static_cast<uint64_t>(fbLoc >> 16) << 24) | 0xFFFFFF, fbOff, static_cast<uint64_t>(fbOff & 0x3FFFF) << 22,
-			m[Reg::MC_VM_SYSTEM_APERTURE_LOW_ADDR], m[Reg::MC_VM_SYSTEM_APERTURE_HIGH_ADDR], m[0x80B], m[0x80A], m[0x80C],
-			m[Reg::HDP_NONSURFACE_BASE], m[Reg::HDP_NONSURFACE_SIZE], m[0x150C], m[0x9D8]);
-		add("gfx: grbm %x/%x, gb addr config %x, shader array config %x, rb backend disable %x\n", m[Reg::GRBM_STATUS],
-			m[0x2002], m[Reg::GB_ADDR_CONFIG], m[Reg::CC_GC_SHADER_ARRAY_CONFIG], m[Reg::CC_RB_BACKEND_DISABLE]);
-		static char display[2048];
-		gcn2DisplayState(family, display, sizeof(display), true);
-		add("display (DCE 8):\n%s", display);
-	} else {
-		add("no MMIO mapping\n");
-	}
-	if (iGPU) {
-		auto *status = OSDynamicCast(OSString, iGPU->getProperty("UnifiedRed,vbios-status"));
-		auto *image = OSDynamicCast(OSData, iGPU->getProperty(VBIOS::ImageProperty));
-		auto *dev = OSDynamicCast(OSData, iGPU->getProperty("device-id"));
-		add("vbios: %s, %s %u bytes; device-id property %x\n", status ? status->getCStringNoCopy() : "no status",
-			VBIOS::ImageProperty, image ? image->getLength() : 0,
-			dev && dev->getLength() >= 2 ? *static_cast<const uint16_t *>(dev->getBytesNoCopy()) : 0);
-	}
-	add("vbios calls %u, %u failed; dce8 map %s: moved %u, dropped %u (%u writes), vbios passed %u, lb fixes %u; "
-		"first dropped (w = write):", atomGcn2Calls, atomGcn2Failed, dce8Remap ? "on" : "off", dce8Moved, dce8Dropped,
-		dce8DroppedWrites, dce8Atom, dce8LbFixes);
-	for (uint32_t i = 0; i < dce8DroppedFirstCount && i < arrsize(dce8DroppedFirst); i++)
-		add(" %x%s", dce8DroppedFirst[i] & 0xFFFF, (dce8DroppedFirst[i] >> 31) ? "w" : "");
-	add("\ncontroller trace: %s\nevents:", traceSummary[0] ? traceSummary : "-");
-	for (uint32_t i = 0; i < arrsize(diskLogRecent); i++) {
-		auto &line = diskLogRecent[(diskLogRecentNext + i) % arrsize(diskLogRecent)];
-		if (line[0])
-			add(" | %s", line);
-	}
-	add("\ntree:\n%s", tree ? tree : "");
-	add("\ndisk log: %s, %u writes, %u errors (last %d)\n", diskLogPath[0] ? diskLogPath : "not started", diskLogWrites,
-		diskLogErrors, diskLogLastError);
-	return report;
-}
 
 void CRDriver::gcn2Watch() {
 	static char now[1536], last[1536], display[1024], lastDisplay[1024];
@@ -4303,6 +4253,17 @@ void CRDriver::gcn2Watch() {
 				iGPU->setProperty("LoadController", true);
 				iGPU->registerService();
 				IOLog("UnifiedRed: t=%us set LoadController on the iGPU and re-registered it\n", t);
+			}
+		}
+		static bool accelRequested;
+		if (!accelRequested && strstr(now, "AMD9500Controller (")) {
+			accelRequested = true;
+			if (!checkKernelArgument("-crnoaccel") && !iGPU->getProperty("LoadAccelerator")) {
+				iGPU->setProperty("LoadHWServices", true);
+				iGPU->setProperty("LoadAccelerator", true);
+				iGPU->registerService();
+				IOLog("UnifiedRed: t=%us set LoadHWServices + LoadAccelerator on the iGPU and re-registered it\n", t);
+				traceNote("LoadAccelerator@%us ", t);
 			}
 		}
 		if (strcmp(now, last) || t % 15 == 0) {
@@ -5452,6 +5413,32 @@ static uint64_t wrapEndVMPTUpdate(void *that) {
 }
 static bool wrapPowerUpHWEngines(void *that);
 
+// GCN 2: AMDRadeonX4000's VI layer reaches the GPU through AMDHWRegisters::read/write (dword offsets; the
+// read-modify-write helpers call both through the vtable). Same table as the controller's (kern_dce8map.hpp, with the
+// GFX 8 -> GFX 7 block), same CONFIG_MEMSIZE view.
+static mach_vm_address_t orgAccelRegRead, orgAccelRegWrite;
+static bool accelRegMap;
+
+static uint32_t wrapAccelRegRead(void *that, uint32_t dword) {
+	auto org = FunctionCast(wrapAccelRegRead, orgAccelRegRead);
+	if (!accelRegMap)
+		return org(that, dword);
+	uint32_t byte = dword << 2;
+	if (!dce8Translate(byte, false, 0, 0))
+		return 0;
+	return gcn2MemSizeRead(byte >> 2, org(that, byte >> 2));
+}
+
+static void wrapAccelRegWrite(void *that, uint32_t dword, uint32_t value) {
+	auto org = FunctionCast(wrapAccelRegWrite, orgAccelRegWrite);
+	if (!accelRegMap)
+		return org(that, dword, value);
+	uint32_t byte = dword << 2;
+	if (!dce8Translate(byte, true, value, 0))
+		return;
+	org(that, byte >> 2, gcn2MemSizeWrite(byte >> 2, value));
+}
+
 void CRDriver::patchAccelerator(KernelPatcher &patcher, size_t index, mach_vm_address_t slide, size_t size) {
 	selectAccelLayouts();
 	auto route = [&](const char *symbol, mach_vm_address_t wrapper, mach_vm_address_t &org, const char *const *checks,
@@ -5480,6 +5467,15 @@ void CRDriver::patchAccelerator(KernelPatcher &patcher, size_t index, mach_vm_ad
 		return true;
 	};
 
+	if (isGcn2(family) && !checkKernelArgument("-crnodce8map")) {
+		bool read = route("__ZN29AMDRadeonX4000_AMDHWRegisters4readEj", reinterpret_cast<mach_vm_address_t>(wrapAccelRegRead),
+			orgAccelRegRead, nullptr, 0, "AMDHWRegisters::read");
+		bool write = route("__ZN29AMDRadeonX4000_AMDHWRegisters5writeEjj",
+			reinterpret_cast<mach_vm_address_t>(wrapAccelRegWrite), orgAccelRegWrite, nullptr, 0, "AMDHWRegisters::write");
+		// Both or neither (the wrappers check the flag): half a translation scrambles the GPU's state.
+		accelRegMap = read && write;
+		traceNote("accelmap=%s ", accelRegMap ? "on" : "FAILED");
+	}
 	// The 16-bank LDS interpolation fix, at submission (see wrapCommitIb).
 	interpFixOff = checkKernelArgument("-crnointerpfix") || family != ChipFamily::Stoney;
 	// Raising a shader's VGPR allocation is safe only when the submit hook sees every command buffer that binds it
@@ -5629,7 +5625,8 @@ void CRDriver::patchAccelerator(KernelPatcher &patcher, size_t index, mach_vm_ad
 	// POP_IDLE_REPLAY (0x800) into the memory arbiter: Polaris GDDR5 sequencer tweaks, which Linux never sets on an APU,
 	// whose arbiter the CPU shares. Make both ORs write 0 (mov esi, 0x9D5; mov edx, imm; call [rax + 0x128]).
 	// -crnoarbfix leaves them.
-	if ((family == ChipFamily::Stoney || family == ChipFamily::Carrizo) && !checkKernelArgument("-crnoarbfix")) {
+	if ((family == ChipFamily::Stoney || family == ChipFamily::Carrizo || isGcn2(family)) &&
+		!checkKernelArgument("-crnoarbfix")) {
 		static const uint8_t find1[] {0xBE, 0xD5, 0x09, 0x00, 0x00, 0xBA, 0x00, 0x00,
 			0x00, 0x40, 0xFF, 0x90, 0x28, 0x01, 0x00, 0x00};
 		static const uint8_t repl1[] {0xBE, 0xD5, 0x09, 0x00, 0x00, 0xBA, 0x00, 0x00,
@@ -5653,8 +5650,10 @@ void CRDriver::patchAccelerator(KernelPatcher &patcher, size_t index, mach_vm_ad
 			}
 		}
 	}
-	// Stoney and Carrizo both have one shader engine with one shader array (Linux gfx_v8_0), against Polaris 11's two.
-	if ((family == ChipFamily::Stoney || family == ChipFamily::Carrizo) && !checkKernelArgument("-crnocapsfix")) {
+	// Stoney and Carrizo both have one shader engine with one shader array (Linux gfx_v8_0), against Polaris 11's two;
+	// so do Kaveri and Kabini/Mullins (gfx_v7_0: max_shader_engines 1, max_sh_per_se 1).
+	if ((family == ChipFamily::Stoney || family == ChipFamily::Carrizo || isGcn2(family)) &&
+		!checkKernelArgument("-crnocapsfix")) {
 		static const char *const capsChecks[] {"c7476402000000", "c7476c01000000", "c787a000000008000000", nullptr};
 		// Monterey's AMDHardware has these fields 8 bytes earlier (SEs 0x5C, SH per SE 0x64, CUs per SH 0x98, the
 		// active CUs AMDVIHardware's setupAndInitializeHWCapabilities stores 0x9C).
@@ -8089,7 +8088,7 @@ void CRDriver::traceKext(KernelPatcher &patcher, size_t index, mach_vm_address_t
 			hwlibsRepatch = [](KernelPatcher &p, size_t i, mach_vm_address_t sl, size_t sz) {
 				callback->traceKext(p, i, sl, sz, KextRadeonX4000HWLibs);
 			};
-		ppDummyForced = (family == ChipFamily::Stoney || family == ChipFamily::Carrizo) &&
+		ppDummyForced = (family == ChipFamily::Stoney || family == ChipFamily::Carrizo || isGcn2(family)) &&
 			!checkKernelArgument("-crnoppdummy");
 		KernelPatcher::RouteRequest requests[] {
 			{"_PECI_ReadRegistry", wrapPeciReadRegistry, orgPeciReadRegistry},
@@ -8571,6 +8570,67 @@ static uint32_t dce8LbFix(uint32_t dword, uint32_t value) {
 	return value;
 }
 
+// CONFIG_MEMSIZE (0x150A, the same on BIF 4.1 and 5.0) as Apple's drivers see it: the carve-out minus the reserve.
+// AMDVIHWMemory::getHWMemorySize sizes VRAM from it; AMDVIHardware::setMemSizeRegister writes it back.
+static uint32_t gcn2MemSizeRead(uint32_t dword, uint32_t value) {
+	if (dword != 0x150A || !gcn2MemMb || (value & 0xFFFF) != gcn2MemMb)
+		return value;
+	__atomic_fetch_add(&gcn2MemSizeFixes, 1, __ATOMIC_RELAXED);
+	return (value & ~0xFFFFu) | (gcn2MemMb - Gcn2ReserveMb);
+}
+
+static uint32_t gcn2MemSizeWrite(uint32_t dword, uint32_t value) {
+	if (dword != 0x150A || !gcn2MemMb || (value & 0xFFFF) != gcn2MemMb - Gcn2ReserveMb)
+		return value;
+	return (value & ~0xFFFFu) | gcn2MemMb;
+}
+
+// The IH control bits moved between OSS 2.0 (CIK, GCN 2) and OSS 3.0 (Tonga/Polaris), Linux cik_ih.c vs tonga_ih.c:
+//  Tonga IH_RB_CNTL: RB_ENABLE 0, RB_SIZE 5:1, GPU_TS 7, WPTR_WRITEBACK_ENABLE 8, ENABLE_INTR 17, MC_SWAP 19:18,
+//                    RPTR_REARM 21, MC_VMID 27:24, WPTR_OVERFLOW_CLEAR 31
+//  Tonga IH_CNTL:    WPTR_WRITEBACK_TIMER 4:0, the FIFO and MC credit fields 24:8
+//  CIK IH_RB_CNTL:   RB_ENABLE 0, RB_SIZE 5:1, GPU_TS 7, WPTR_WRITEBACK_ENABLE 8, WPTR_WRITEBACK_TIMER 13:9,
+//                    WPTR_OVERFLOW_ENABLE 16, WPTR_OVERFLOW_CLEAR 31
+//  CIK IH_CNTL:      ENABLE_INTR 0, MC_SWAP 2:1, MC_TRAN 3, RPTR_REARM 4, the same FIFO and MC fields 24:8, MC_VMID 28:25
+// Apple's BaffinInterruptManager writes the Tonga layout to Tonga's offsets (0xE30, 0xE36); write and read both CIK
+// registers (0xF80, 0xF86) in their own layout instead. WPTR_OVERFLOW_ENABLE is set as Linux does.
+namespace CikIh {
+	static constexpr uint32_t TongaRbCntl = 0xE30, TongaCntl = 0xE36, RbCntl = 0xF80, Cntl = 0xF86;
+	static constexpr uint32_t RbCommon = 0x800001BF, TimerShift = 9, TimerMask = 0x3E00, OverflowEnable = 0x10000;
+	static constexpr uint32_t CntlFifo = 0x01FFFF00, CntlTongaBits = 0x1E000017;
+}
+
+static bool ihTongaWrite(uint32_t dword, uint32_t value) {
+	using namespace CikIh;
+	auto *m = gpuMmio;
+	if (!m || (dword != TongaRbCntl && dword != TongaCntl))
+		return false;
+	__atomic_fetch_add(&ihTongaWrites, 1, __ATOMIC_RELAXED);
+	if (dword == TongaRbCntl)
+		ihTongaRbCntl = value;
+	else
+		ihTongaCntl = value;
+	uint32_t rb = ihTongaRbCntl, cntl = ihTongaCntl;
+	m[RbCntl] = (rb & RbCommon) | ((cntl & 0x1F) << TimerShift) | OverflowEnable;
+	m[Cntl] = (m[Cntl] & ~(CntlFifo | CntlTongaBits)) | (cntl & CntlFifo) | ((rb >> 17) & 1) | (((rb >> 18) & 3) << 1) |
+		(((rb >> 21) & 1) << 4) | (((rb >> 24) & 0xF) << 25);
+	return true;
+}
+
+static bool ihTongaRead(uint32_t dword, uint32_t &value) {
+	using namespace CikIh;
+	auto *m = gpuMmio;
+	if (!m || (dword != TongaRbCntl && dword != TongaCntl))
+		return false;
+	uint32_t rb = m[RbCntl], cntl = m[Cntl];
+	if (dword == TongaRbCntl)
+		value = (rb & RbCommon) | ((cntl & 1) << 17) | (((cntl >> 1) & 3) << 18) | (((cntl >> 4) & 1) << 21) |
+			(((cntl >> 25) & 0xF) << 24);
+	else
+		value = (cntl & CntlFifo) | ((rb & TimerMask) >> TimerShift);
+	return true;
+}
+
 // readReg32 reads through hwReadReg32 (vtable +0x160), so with -crreglogall each such read shows twice; the inner one
 // is marked "/0x1".
 uint32_t CRDriver::wrapHwRead32(void *that, uint32_t offset) {
@@ -8620,8 +8680,19 @@ void CRDriver::wrapWrite8(void *that, uint32_t offset, uint32_t value) {
 }
 
 uint32_t CRDriver::wrapRegRead32(void *that, uint32_t offset) {
-	if (dce8Remap && !dce8Translate(offset, false, 0, reinterpret_cast<mach_vm_address_t>(__builtin_return_address(0))))
-		return 0;
+	if (dce8Remap) {
+		auto ra = reinterpret_cast<mach_vm_address_t>(__builtin_return_address(0));
+		uint32_t ih;
+		if (!fromAtom(ra) && ihTongaRead(offset >> 2, ih))
+			return ih;
+		if (!dce8Translate(offset, false, 0, ra))
+			return 0;
+		int flags = regAccess(RegRead, offset, 0, 0);
+		if (flags & RegBlocked)
+			return 0;
+		uint32_t value = FunctionCast(wrapRegRead32, callback->orgRegRead32)(that, offset);
+		return regReadDone(flags, fromAtom(ra) ? value : gcn2MemSizeRead(offset >> 2, value));
+	}
 	int flags = regAccess(RegRead, offset, 0, 0);
 	if (flags & RegBlocked)
 		return 0;
@@ -8638,10 +8709,12 @@ uint32_t CRDriver::wrapRegRead32(void *that, uint32_t offset) {
 void CRDriver::wrapRegWrite32(void *that, uint32_t offset, uint32_t value) {
 	if (dce8Remap) {
 		auto ra = reinterpret_cast<mach_vm_address_t>(__builtin_return_address(0));
+		if (!fromAtom(ra) && ihTongaWrite(offset >> 2, value))
+			return;
 		if (!dce8Translate(offset, true, value, ra))
 			return;
 		if (!fromAtom(ra))
-			value = dce8LbFix(offset >> 2, value);
+			value = gcn2MemSizeWrite(offset >> 2, dce8LbFix(offset >> 2, value));
 		if (!(regAccess(RegWrite, offset, 0, value) & RegBlocked))
 			FunctionCast(wrapRegWrite32, callback->orgRegWrite32)(that, offset, value);
 		return;
@@ -8731,7 +8804,19 @@ static void moveIhRing(void *manager) {
 		ihMoveResult = "off";
 		return;
 	}
-	if (!smuLoad.result || !smuLoad.phys || !smuLoad.mc) {
+	// The ring's place in VRAM: after the SMU data on Carrizo/Stoney, the start of the reserve on GCN 2.
+	uint64_t ringPhys = 0, ringMc = 0;
+	if (gcn2Gpu) {
+		if (gcn2ReservePhys && gpuMmio) {
+			ringPhys = gcn2ReservePhys;
+			ringMc = (static_cast<uint64_t>(gpuMmio[Reg::MC_VM_FB_LOCATION] & 0xFFFF) << 24) +
+				(static_cast<uint64_t>(gcn2MemMb - Gcn2ReserveMb) << 20);
+		}
+	} else if (smuLoad.result && smuLoad.phys && smuLoad.mc) {
+		ringPhys = smuLoad.phys + IhOffset;
+		ringMc = smuLoad.mc + IhOffset;
+	}
+	if (!ringPhys || !ringMc) {
 		ihMoveResult = "no VRAM region";
 		return;
 	}
@@ -8740,14 +8825,14 @@ static void moveIhRing(void *manager) {
 		ihMoveResult = "ring size doesn't fit";
 		return;
 	}
-	auto *desc = IOMemoryDescriptor::withPhysicalAddress(smuLoad.phys + IhOffset, size + 0x1000, kIODirectionInOut);
+	auto *desc = IOMemoryDescriptor::withPhysicalAddress(ringPhys, size + 0x1000, kIODirectionInOut);
 	ihRingMap = desc ? desc->map(kIOMapInhibitCache) : nullptr;
 	OSSafeReleaseNULL(desc);
 	if (!ihRingMap) {
 		ihMoveResult = "can't map the ring";
 		return;
 	}
-	ihMovedGpu = smuLoad.mc + IhOffset;
+	ihMovedGpu = ringMc;
 	ihRingSize = size;
 	reapplyIhRing(manager);
 	ihMoveResult = "moved";
@@ -8757,10 +8842,9 @@ static void moveIhRing(void *manager) {
 void CRDriver::wrapIhSetHardwareEnabled(void *that, bool enable) {
 	if (enable)
 		moveIhRing(that);
-	// GCN 2: the CIK IH (OSS 2.0) is reached through the translation, but its enable bits differ from Tonga's (IH_CNTL
-	// ENABLE_INTR, as on CZ); keep it off until that is handled. -crgcn2ih lets Apple's enable through.
+	// GCN 2: the CIK IH is reached through the translation, with ihTongaWrite moving the enable bits to IH_CNTL.
 	bool gcn2 = isGcn2(callback->family);
-	bool off = enable && (checkKernelArgument("-crnoih") || (gcn2 && !checkKernelArgument("-crgcn2ih")));
+	bool off = enable && checkKernelArgument("-crnoih");
 	ihEnableCalls++;
 	ihLastEnable = enable && !off;
 	ihManager = that;
@@ -10245,6 +10329,12 @@ void CRDriver::probeMMIO() {
 		gcn2DisplayState(family, display, sizeof(display), false);
 		SYSLOG("cr", "DCE 8 display state at start-up: %s", display);
 		iGPU->setProperty("UnifiedRed,gcn2-display", display);
+		if (memSize > 2 * Gcn2ReserveMb && carveoutPhys && !checkKernelArgument("-crnogcn2reserve")) {
+			gcn2MemMb = memSize & 0xFFFF;
+			gcn2ReservePhys = carveoutPhys + (static_cast<uint64_t>(gcn2MemMb - Gcn2ReserveMb) << 20);
+			SYSLOG("cr", "GCN 2: top %u MB of the carve-out reserved at 0x%llX", Gcn2ReserveMb, gcn2ReservePhys);
+		}
+		relocateFb();
 		return;
 	}
 	initDisplayRegs();
@@ -10278,9 +10368,11 @@ void CRDriver::relocateFb() {
 	fbRelocNew = moved;
 	fbRelocBase = base;
 	// Scanout surfaces are MC addresses: move every enabled pipe's primary and secondary surface down with the FB.
+	// DCE 8 (GCN 2): other pipe strides and power-gating registers, the same GRPH offsets within a pipe.
+	bool dce8 = isGcn2(family);
 	for (uint32_t pipe = 0; pipe < displayPipes(family); pipe++) {
-		uint32_t r = pipeRegisterBase(pipe);
-		bool powered = (mmio[Reg::PIPE0_PG_STATUS + 3 * pipe] >> 30) == 0;
+		uint32_t r = dce8 ? Dce8::BlockOffset[pipe] : pipeRegisterBase(pipe);
+		bool powered = dce8 ? gcn2PipePowered(mmio, pipe) : (mmio[Reg::PIPE0_PG_STATUS + 3 * pipe] >> 30) == 0;
 		if (!powered || !(mmio[Reg::GRPH_ENABLE + r] & 1))
 			continue;
 		for (uint32_t surface = 0; surface < 2; surface++) {
@@ -15029,4 +15121,75 @@ void CRDriver::checkDisplayRegs(uint32_t t) {
 void CRDriver::disableKextCallbacks() {
 	for (auto &kext : kexts)
 		kext.switchOff();
+}
+
+const char *CRDriver::composeReportGcn2(uint32_t t, const char *tree) {
+	static char report[8192];
+	size_t len = 0;
+	auto add = [&](const char *fmt, ...) {
+		if (len + 1 >= sizeof(report))
+			return;
+		va_list va;
+		va_start(va, fmt);
+		int n = vsnprintf(report + len, sizeof(report) - len, fmt, va);
+		va_end(va);
+		if (n > 0)
+			len += static_cast<size_t>(n) < sizeof(report) - len ? static_cast<size_t>(n) : sizeof(report) - len - 1;
+	};
+	report[0] = '\0';
+	add("UnifiedRed " xStringify(MODULE_VERSION) " (%s, %s) t=%us, %s %04x rev %x, kernel %d.%d\n", xStringify(CR_COMMIT),
+		CR_BUILD_KIND, t, familyName(family), deviceId, revision, getKernelVersion(), getKernelMinorVersion());
+	if (iGPU)
+		add("pci %04x:%04x cmd %x status %x bar0 %x bar2 %x bar5 %x; mmio phys %llx mapped at %llu ms (method %u, "
+			"failures %u)\n", iGPU->configRead16(kIOPCIConfigVendorID), iGPU->configRead16(kIOPCIConfigDeviceID),
+			iGPU->configRead16(kIOPCIConfigCommand), iGPU->configRead16(kIOPCIConfigStatus),
+			iGPU->configRead32(kIOPCIConfigBaseAddress0), iGPU->configRead32(kIOPCIConfigBaseAddress2),
+			iGPU->configRead32(kIOPCIConfigBaseAddress5), probePhys, probeMs, mmioMapMethod, mmioMapFailures);
+	if (auto *m = gpuMmio) {
+		// gmc_7_1 / bif_4_1 / oss_2_0 / gfx_7_0: the same offsets as on VI for all of these.
+		uint32_t memSize = m[Reg::CONFIG_MEMSIZE], fbLoc = m[Reg::MC_VM_FB_LOCATION], fbOff = m[Reg::MC_VM_FB_OFFSET];
+		add("mc: memsize %x (%u MB), fb location %x (MC %llx-%llx), fb offset %x -> carve-out at system %llx; "
+			"aperture %x-%x, agp %x-%x base %x, hdp nonsurface %x size %x, aper size %x, ramcfg %x\n", memSize,
+			memSize & 0xFFFF, fbLoc, static_cast<uint64_t>(fbLoc & 0xFFFF) << 24,
+			(static_cast<uint64_t>(fbLoc >> 16) << 24) | 0xFFFFFF, fbOff, static_cast<uint64_t>(fbOff & 0x3FFFF) << 22,
+			m[Reg::MC_VM_SYSTEM_APERTURE_LOW_ADDR], m[Reg::MC_VM_SYSTEM_APERTURE_HIGH_ADDR], m[0x80B], m[0x80A], m[0x80C],
+			m[Reg::HDP_NONSURFACE_BASE], m[Reg::HDP_NONSURFACE_SIZE], m[0x150C], m[0x9D8]);
+		add("gfx: grbm %x/%x, gb addr config %x, shader array config %x, rb backend disable %x\n", m[Reg::GRBM_STATUS],
+			m[0x2002], m[Reg::GB_ADDR_CONFIG], m[Reg::CC_GC_SHADER_ARRAY_CONFIG], m[Reg::CC_RB_BACKEND_DISABLE]);
+		static char display[2048];
+		gcn2DisplayState(family, display, sizeof(display), true);
+		add("display (DCE 8):\n%s", display);
+	} else {
+		add("no MMIO mapping\n");
+	}
+	if (iGPU) {
+		auto *status = OSDynamicCast(OSString, iGPU->getProperty("UnifiedRed,vbios-status"));
+		auto *image = OSDynamicCast(OSData, iGPU->getProperty(VBIOS::ImageProperty));
+		auto *dev = OSDynamicCast(OSData, iGPU->getProperty("device-id"));
+		add("vbios: %s, %s %u bytes; device-id property %x\n", status ? status->getCStringNoCopy() : "no status",
+			VBIOS::ImageProperty, image ? image->getLength() : 0,
+			dev && dev->getLength() >= 2 ? *static_cast<const uint16_t *>(dev->getBytesNoCopy()) : 0);
+	}
+	add("vbios calls %u, %u failed; dce8 map %s: moved %u, dropped %u (%u writes), vbios passed %u, lb fixes %u; "
+		"first dropped (w = write):", atomGcn2Calls, atomGcn2Failed, dce8Remap ? "on" : "off", dce8Moved, dce8Dropped,
+		dce8DroppedWrites, dce8Atom, dce8LbFixes);
+	for (uint32_t i = 0; i < dce8DroppedFirstCount && i < arrsize(dce8DroppedFirst); i++)
+		add(" %x%s", dce8DroppedFirst[i] & 0xFFFF, (dce8DroppedFirst[i] >> 31) ? "w" : "");
+	add("\nreserve %u MB at %llx (memsize views %u), ih tonga writes %u ring %s at %llx, ih calls %u rptr writes %u; "
+		"accel map %s, fb reloc %x -> %x (reads %x); cail waits %u, %u failed:", Gcn2ReserveMb, gcn2ReservePhys,
+		gcn2MemSizeFixes, ihTongaWrites, ihMoveResult ? ihMoveResult : "-", ihMovedGpu,
+		__atomic_load_n(&ihHandlerCalls, __ATOMIC_RELAXED), __atomic_load_n(&ihReadPointerWrites, __ATOMIC_RELAXED),
+		accelRegMap ? "on" : "off", fbRelocOld, fbRelocNew, fbRelocReadback, cailWaits, cailWaitFailures);
+	for (uint32_t i = 0; i < cailWaitFailures && i < 4; i++)
+		add(" [%x]&%x!=%x(%x)", cailWaitFails[i].reg, cailWaitFails[i].mask, cailWaitFails[i].value, cailWaitFails[i].read);
+	add("\ncontroller trace: %s\nevents:", traceSummary[0] ? traceSummary : "-");
+	for (uint32_t i = 0; i < arrsize(diskLogRecent); i++) {
+		auto &line = diskLogRecent[(diskLogRecentNext + i) % arrsize(diskLogRecent)];
+		if (line[0])
+			add(" | %s", line);
+	}
+	add("\ntree:\n%s", tree ? tree : "");
+	add("\ndisk log: %s, %u writes, %u errors (last %d)\n", diskLogPath[0] ? diskLogPath : "not started", diskLogWrites,
+		diskLogErrors, diskLogLastError);
+	return report;
 }

@@ -164,4 +164,12 @@ iMac19,1, 2 cores, Lilu, VirtualSMC, RestrictEvents, CryptexFixup, RealtekRTL811
 alone. BIOS: IOMMU off, Secure Boot off, CSM off. Install from a **USB 2.0 port** (EHCI, native) and over Ethernet.
 
 ### Install log
-- (none yet)
+- **2026-11-15, Monterey 12.7.6 from an offline installer:** installs and boots on the firmware framebuffer
+  (`vendor-id` FFFF0000). Setup Assistant goes grey after the country screen (no acceleration). USB: low-speed mouse
+  works on the black ports (OHCI), the full-speed keyboard doesn't (EHCI "persistent enumeration failures"); the blue
+  ports enumerate at 480 Mbps only. A boot from the blue ports once stopped at `validate_root_image`.
+- **2026-11-15, `--bonaire` (UnifiedRed 7a6188d):** AMD8000Controller takes over the display (HDMI): picture.
+- **2026-11-15, `--spoof` (UnifiedRed 88c98a2, DCE 11.2 → DCE 8 translation, IH off, `-crnoaccel`):** AMD9500Controller
+  takes over the display: picture, first try.
+- Getting logs off the machine is the open problem: no keyboard in the installer's Terminal, `dmpstore` to the USB
+  stick freezes, and a panic restarts instead of staying on screen.
