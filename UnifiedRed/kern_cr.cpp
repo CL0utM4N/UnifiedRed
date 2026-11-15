@@ -1,11 +1,12 @@
 //
 //  kern_cr.cpp
-//  CarrizoRed
+//  UnifiedRed
 //
 //  Phase 1: observe only. Finds the iGPU, logs what the hardware reports, and
 //  watches Apple's Polaris kexts load. Nothing is patched yet.
 //
 
+#include "kern_platprobe.hpp"
 #include "kern_cr.hpp"
 #include "kern_vbios.hpp"
 #include "kern_sigs.hpp"
@@ -23,6 +24,8 @@
 #include <kern/debug.h>
 #include <kern/clock.h>
 #include <IOKit/IOMessage.h>
+#include <IOKit/IORangeAllocator.h>
+#include <IOKit/IOBufferMemoryDescriptor.h>
 #include <IOKit/IOPlatformExpert.h>
 #include <IOKit/acpi/IOACPIPlatformDevice.h>
 
@@ -47,7 +50,7 @@
 // Trampolines: Lilu builds every plugin's in one shared 4 KB buffer (KernelPatcher::tempExecutableMemory). Once it is
 // full, createTrampoline returns 0, routeFunctionInternal returns EINVAL, and routeMultiple takes that non-zero value for
 // the trampoline's address and reports success: the function is left untouched and nothing is logged as failed. With
-// ~150 traced stages CarrizoRed alone needs more than 4 KB, so whichever kext loaded last lost its hooks; HWLibs, loaded
+// ~150 traced stages UnifiedRed alone needs more than 4 KB, so whichever kext loaded last lost its hooks; HWLibs, loaded
 // last on most boots, lost CAIL's (nvram133/40: earlyInitialize still Apple's prologue at setupCAIL, the "re-patch"
 // reported success and changed nothing, yet a direct write landed). So routeChecked builds the trampoline itself, in
 // its own pool, has Lilu write only the jump (no wrapper, so no trampoline), and reads the jump back.
@@ -433,7 +436,7 @@ static void checkGpuAlive(volatile uint32_t *mmio) {
 	if (!gpuDeadMs && gpuRegistersDead(mmio)) {
 		uint64_t ms = uptimeMs();
 		gpuDeadMs = ms ? ms : 1;
-		IOLog("CarrizoRed: the GPU stopped responding (registers read 0xFFFFFFFF); power the machine off fully\n");
+		IOLog("UnifiedRed: the GPU stopped responding (registers read 0xFFFFFFFF); power the machine off fully\n");
 	}
 }
 
@@ -1239,7 +1242,7 @@ static const char *className(const OSObject *object) {
 
 [[noreturn]] static void preemptionLeak(const char *where, IOEventSource *source, int32_t before, int32_t after) {
 	OSObject *owner = source ? EventSourcePeek::ownerOf(source) : nullptr;
-	panic("CarrizoRed: preemption level %d -> %d across %s: %s, owner %s, action %p", before, after, where,
+	panic("UnifiedRed: preemption level %d -> %d across %s: %s, owner %s, action %p", before, after, where,
 		className(source), className(owner), source ? EventSourcePeek::actionOf(source) : nullptr);
 }
 
@@ -1271,7 +1274,7 @@ static bool wrapRunEventSources(IOWorkLoop *that) {
 			snprintf(list + len, sizeof(list) - len, "%s%s/%s %p", n ? ", " : "", className(source),
 				className(EventSourcePeek::ownerOf(source)), EventSourcePeek::actionOf(source));
 		}
-		panic("CarrizoRed: preemption level %d -> %d across IOWorkLoop::runEventSources, sources: %s", before, after,
+		panic("UnifiedRed: preemption level %d -> %d across IOWorkLoop::runEventSources, sources: %s", before, after,
 			list);
 	}
 	return ok;
@@ -1304,7 +1307,7 @@ static IOReturn wrapMessageClient(IOService *that, UInt32 type, OSObject *client
 			handler = *reinterpret_cast<mach_vm_address_t *>(reinterpret_cast<uint8_t *>(client) + 0x20);
 			target = *reinterpret_cast<mach_vm_address_t *>(reinterpret_cast<uint8_t *>(client) + 0x28);
 		}
-		panic("CarrizoRed: preemption level %d -> %d across IOService::messageClient: message %x from %s to %s, "
+		panic("UnifiedRed: preemption level %d -> %d across IOService::messageClient: message %x from %s to %s, "
 			"handler %p in %s, target %p", before, after, type, className(that), cls, reinterpret_cast<void *>(handler),
 			kextOf(handler), reinterpret_cast<void *>(target));
 	}
@@ -1348,7 +1351,10 @@ static void hookPreemptionCheck(KernelPatcher &patcher) {
 
 void CRDriver::init() {
 	callback = this;
-	SYSLOG("cr", "CarrizoRed starting on kernel %d.%d", getKernelVersion(), getKernelMinorVersion());
+	// First, before anything of ours touches the hardware: the read-only platform probe (-crplatprobe, from KaberiRed;
+	// for the Kabini boot freeze, docs/gcn2/TEST_MACHINES.md).
+	PlatformProbe::start();
+	SYSLOG("cr", "UnifiedRed starting on kernel %d.%d", getKernelVersion(), getKernelMinorVersion());
 
 	lilu.onPatcherLoadForce(
 		[](void *user, KernelPatcher &patcher) { static_cast<CRDriver *>(user)->processPatcher(patcher); }, this);
@@ -1369,6 +1375,8 @@ struct KernelMsgBuf {
 static KernelMsgBuf **msgbufVar;
 
 void CRDriver::processPatcher(KernelPatcher &patcher) {
+	if (checkKernelArgument("-crplatprobe"))
+		PlatformProbe::checkIdle(patcher);
 	physmapBaseVar = reinterpret_cast<uint64_t *>(patcher.solveSymbol(KernelPatcher::KernelID, "_physmap_base"));
 	physmapMaxVar = reinterpret_cast<uint64_t *>(patcher.solveSymbol(KernelPatcher::KernelID, "_physmap_max"));
 	msgbufVar = reinterpret_cast<KernelMsgBuf **>(patcher.solveSymbol(KernelPatcher::KernelID, "_msgbufp"));
@@ -1502,7 +1510,7 @@ void CRDriver::processPatcher(KernelPatcher &patcher) {
 	// AMDSupport reads the VBIOS from "ATY,bin_image" before trying the (absent) PCI ROM.
 	if (!checkKernelArgument("-crnovbios")) {
 		bool ok = VBIOS::inject(iGPU, WIOKit::VendorID::ATIAMD, deviceId);
-		iGPU->setProperty("CarrizoRed,vbios-injected", ok);
+		iGPU->setProperty("UnifiedRed,vbios-injected", ok);
 	}
 	keepVbiosImage(iGPU);
 	setSoftPowerPlayTable();
@@ -1524,11 +1532,11 @@ void CRDriver::setSoftPowerPlayTable() {
 		image->getLength(), VBIOS::PowerPlayInfoTable, size) : nullptr;
 	if (!table) {
 		SYSLOG("cr", "no PowerPlayInfo table in the VBIOS, PowerPlay will look for it itself");
-		iGPU->setProperty("CarrizoRed,soft-pptable", "none");
+		iGPU->setProperty("UnifiedRed,soft-pptable", "none");
 		return;
 	}
 	iGPU->setProperty("PP_PhmSoftPowerPlayTable", const_cast<uint8_t *>(table), size);
-	iGPU->setProperty("CarrizoRed,soft-pptable", size, 16);
+	iGPU->setProperty("UnifiedRed,soft-pptable", size, 16);
 	softPPTableSize = size;
 	softPPTableRev = static_cast<uint16_t>(table[2] << 8 | table[3]);
 	SYSLOG("cr", "PP_PhmSoftPowerPlayTable: VBIOS PowerPlayInfo, %u bytes, rev %u.%u", size, table[2], table[3]);
@@ -1570,7 +1578,16 @@ static bool wrapUvdContextInit(void *that, void *accel, void *videoContext, uint
 static mach_vm_address_t orgUvdStart;
 static bool wrapUvdStart(void *that);
 static void uvdLiveTick();
+static void vceLiveTick();
+static void uvdBridgeTick();
 static uint64_t ibMcToPhys(uint64_t addr, bool system);
+static uint64_t ibVaToPhys(uint32_t vmid, uint64_t va);
+static uint64_t vmWalkInfo(uint32_t vmid, uint64_t va, uint32_t *flags, uint64_t *pde0);
+static bool vceBridgeBlock(uint32_t *blk);
+static bool ibReadPhys(uint64_t phys, uint32_t bytes, void *out, bool coherent);
+static uint8_t *carvePtr(uint64_t phys, uint32_t bytes);
+static uint8_t *physmapPtr(uint64_t phys, uint32_t bytes);
+static void flushLines(const uint8_t *p, uint32_t bytes);
 static bool physRangeOk(uint64_t phys, uint32_t bytes);
 static mach_vm_address_t orgAddPlistPropertiesToPCIDevice;
 static uint64_t wrapAddPlistPropertiesToPCIDevice(IOService *that, const char *name);
@@ -1585,6 +1602,19 @@ static struct {
 static bool uvdReadyForSession();
 static mach_vm_address_t orgVceContextInit;
 static bool wrapVceContextInit(void *that, void *accel, void *videoContext, uint32_t *createInfo);
+static mach_vm_address_t orgVceWriteTail, orgVceGetHead, orgRingEnable, orgRingDisable, orgRingSubmit, orgRingFlush,
+	orgVceRegLoc, orgVceLlqRegLoc, vceRingVtable, vceLlqRingVtable, orgGartInit, uvdDecRingVtable;
+static void uvdBridgeRing(void *that);
+static void vceBridgeForget();
+static bool wrapGartInit(void *that, void *hw, void *params);
+static void wrapVceWriteTail(void *that);
+static uint32_t wrapVceGetHead(void *that);
+static bool wrapRingEnable(void *that);
+static void wrapRingDisable(void *that);
+static void wrapRingSubmit(void *that);
+static void wrapRingFlush(void *that);
+static bool wrapVceRegLoc(void *that);
+static bool wrapVceLlqRegLoc(void *that);
 
 void CRDriver::processKext(KernelPatcher &patcher, size_t index, mach_vm_address_t slide, size_t size) {
 	for (size_t i = 0; i < arrsize(kexts); i++) {
@@ -1750,7 +1780,7 @@ void CRDriver::patchPlls(KernelPatcher &patcher, size_t index, mach_vm_address_t
 
 void *CRDriver::wrapCreatePllAssigner(void *controller, void *connectors, uint8_t numConnectors, uint8_t numPlls) {
 	uint8_t plls = numPlls > DisplayPlls ? DisplayPlls : numPlls;
-	IOLog("CarrizoRed: PLL assigner: %u connectors, %u PLLs (Apple asked for %u)\n", numConnectors, plls, numPlls);
+	IOLog("UnifiedRed: PLL assigner: %u connectors, %u PLLs (Apple asked for %u)\n", numConnectors, plls, numPlls);
 	traceNote("plls=%u/%u ", plls, numPlls);
 	return FunctionCast(wrapCreatePllAssigner, callback->orgCreatePllAssigner)(controller, connectors, numConnectors,
 		plls);
@@ -1768,7 +1798,7 @@ uint64_t CRDriver::wrapSetPixelClock(void *that, void *clockParams, const void *
 	memcpy(&clock, static_cast<uint8_t *>(clockParams) + 0x08, sizeof(clock));
 	const char *note = pll >= DisplayPlls && pll <= 5 ? " (INVALID on the APU)" : "";
 	if (ml_get_interrupts_enabled())
-		IOLog("CarrizoRed: setPixelClock crtc %u PLL %u -> ATOM %u, clock %u%s\n", crtc, pll, atomPll, clock, note);
+		IOLog("UnifiedRed: setPixelClock crtc %u PLL %u -> ATOM %u, clock %u%s\n", crtc, pll, atomPll, clock, note);
 	traceEvent("setPixelClock crtc<<16|pll<<8|atom", true, (crtc << 16) | (pll << 8) | atomPll);
 	return FunctionCast(wrapSetPixelClock, callback->orgSetPixelClock)(that, clockParams, info);
 }
@@ -1781,9 +1811,9 @@ void CRDriver::wrapSetCrtcToPixelClock(void *that, uint8_t crtc, uint8_t pll, vo
 
 // While Apple's display stack starts, print what attached below the iGPU (classes and names, 3 levels) to the verbose
 // console whenever it changes, for 10 minutes. When the panel keeps showing the boot console but the GUI has started
-// elsewhere, this is the only output that can be seen. Also published as "CarrizoRed,tree". -crnowatch stops the
+// elsewhere, this is the only output that can be seen. Also published as "UnifiedRed,tree". -crnowatch stops the
 // printing (the thread still requests the controller, see below).
-// System sleep and wake in the disk log: sleep (S3) powers the GPU off, and what CarrizoRed set up once per boot (SMU
+// System sleep and wake in the disk log: sleep (S3) powers the GPU off, and what UnifiedRed set up once per boot (SMU
 // microcode load, the FB window move, SCLK DPM, RB+, video power) has to be redone on wake. First, see the sequence.
 static void diskLogEvent(const char *fmt, ...);
 static void wakeMarkStart();
@@ -3200,7 +3230,7 @@ static void mirrorKernelLog() {
 		if (c != '\n')
 			continue;  // overlong: cut, the rest dropped until the newline
 		line[lineLen] = '\0';
-		bool want = !strnstr(line, "CarrizoRed", lineLen) && !strnstr(line, "CapabilityChange[", lineLen) &&
+		bool want = !strnstr(line, "UnifiedRed", lineLen) && !strnstr(line, "CapabilityChange[", lineLen) &&
 			!strnstr(line, "display_change_handler", lineLen);
 		bool hit = false;
 		for (size_t k = 0; want && !hit && k < arrsize(keys); k++)
@@ -3210,7 +3240,7 @@ static void mirrorKernelLog() {
 			mirrored++;
 			if (echoed < 40 && (strnstr(line, "ccelerator", lineLen) || strnstr(line, "Failed to", lineLen))) {
 				echoed++;
-				IOLog("CarrizoRed: klog: %s\n", line);
+				IOLog("UnifiedRed: klog: %s\n", line);
 			}
 		}
 		lineLen = 0;
@@ -3221,7 +3251,7 @@ void CRDriver::wakeWatchdogFired(const char *when, bool notPoweredOn, uint32_t b
 	if (!notPoweredOn && beats >= 20)
 		return;
 	char reason[200];
-	snprintf(reason, sizeof(reason), "CarrizoRed: wake stuck %s: %s, watcher ticks %u (sleep %u, wake %u).", when,
+	snprintf(reason, sizeof(reason), "UnifiedRed: wake stuck %s: %s, watcher ticks %u (sleep %u, wake %u).", when,
 		notPoweredOn ? "system never powered on" : "the watcher stopped", beats, systemSleeps, systemWakes);
 	panic("%s\n%s", reason, callback->composeReport(0, ""));
 }
@@ -3314,7 +3344,7 @@ static void backlightCheck() {
 	} else {
 		add(" no \"backlight\" device;");
 	}
-	// No IOGraphicsFamily symbols here (CarrizoRed doesn't link against it: an unbound import of IODisplay's metaclass
+	// No IOGraphicsFamily symbols here (UnifiedRed doesn't link against it: an unbound import of IODisplay's metaclass
 	// panicked the watcher at boot, nvram50): classes by name, display -> IODisplayConnect -> framebuffer through the
 	// registry, and only a virtual call on the framebuffer (connection 0, the panel's).
 	if (auto *iter = IOService::getMatchingServices(IOService::serviceMatching("IODisplay"))) {
@@ -3355,7 +3385,7 @@ static void backlightCheck() {
 // 194 entries, Monterey's has none (D509BA log 1746870993: only IODisplayParameters), so the panel never got the
 // parameter. With a "Default" entry and a framebuffer that answers kConnectionRawBacklight ('bklt', AMD's does: 0-255),
 // it builds its brightness curve from the framebuffer's range (0, max/4, 3max/4, max*1021/1024) and drives the
-// backlight through 'bklt'; the entry's own four big-endian points are then not used. So CarrizoRed gives it one,
+// backlight through 'bklt'; the entry's own four big-endian points are then not used. So UnifiedRed gives it one,
 // with its own points, before the panel's IODisplay starts (that's when the display collects its parameter handlers).
 // -crnobacklight leaves it alone.
 static bool backlightPanelsDone;
@@ -3600,7 +3630,7 @@ static void sampleGpuClock() {
 
 // Disk log (-crnodisklog disables). A freeze stops the CPU, and kernel NVRAM writes outside a panic never reach the
 // flash (nvram183-203), so a hard freeze left nothing. Instead, every second a line of GPU, SMU and DPM state is
-// appended to /private/var/log/CarrizoRed-<boot time>.log and forced to disk (open, write, fsync, close each time: a
+// appended to /private/var/log/UnifiedRed-<boot time>.log and forced to disk (open, write, fsync, close each time: a
 // freeze loses at most the last second, and nothing stays open at shutdown). Events (every SMU message and its answer,
 // DPM steps) are queued in memory from boot and written with the next line; the full black-box report is appended at
 // t=120 s and every 300 s. One file per boot: several test boots, then copy them all off in one go.
@@ -3757,7 +3787,7 @@ static bool diskLogAppend(const char *text, size_t len) {
 		clock_sec_t secs = 0;
 		clock_usec_t usecs = 0;
 		clock_get_calendar_microtime(&secs, &usecs);
-		snprintf(diskLogPath, sizeof(diskLogPath), "/private/var/log/CarrizoRed-%lu.log", static_cast<unsigned long>(secs));
+		snprintf(diskLogPath, sizeof(diskLogPath), "/private/var/log/UnifiedRed-%lu.log", static_cast<unsigned long>(secs));
 	}
 	vfs_context_t ctx = vfs_context_create(nullptr);
 	if (!ctx)
@@ -3896,7 +3926,7 @@ static void diskLogTick(uint32_t t, uint32_t stallTicks) {
 			len += static_cast<size_t>(n) < sizeof(line) - len ? static_cast<size_t>(n) : sizeof(line) - len - 1;
 	};
 	if (!diskLogStarted) {
-		add("CarrizoRed disk log; build %s (%s, " xStringify(MODULE_VERSION) "); boot-args: %s\ncolumns: t ms | sclk cur/tgt "
+		add("UnifiedRed disk log; build %s (%s, " xStringify(MODULE_VERSION) "); boot-args: %s\ncolumns: t ms | sclk cur/tgt "
 			"level (profile) | vid gfx/nb | temp C | GRBM_STATUS GRBM_STATUS2 CP_STAT | gfx rptr/wptr | sdma0 rptr/wptr | "
 			"ih rptr/wptr | flips perf/irq | submits fixed | smu msg/resp/arg | stall | dpm | ih calls/false alarms/broken "
 			"[| uvd ... vce ...] | cpu P-state, clock while busy\n", xStringify(CR_COMMIT), CR_BUILD_KIND,
@@ -4032,15 +4062,15 @@ void CRDriver::watcherThread(void *arg, wait_result_t) {
 		// New trace events (written lock-free by the wrappers).
 		uint32_t head = __atomic_load_n(&traceHead, __ATOMIC_RELAXED);
 		if (head - printed > TraceRingSize) {
-			IOLog("CarrizoRed: (%u trace events dropped)\n", head - printed - static_cast<uint32_t>(TraceRingSize));
+			IOLog("UnifiedRed: (%u trace events dropped)\n", head - printed - static_cast<uint32_t>(TraceRingSize));
 			printed = head - static_cast<uint32_t>(TraceRingSize);
 		}
 		for (; printed != head; printed++) {
 			auto &event = traceRing[printed % TraceRingSize];
 			if (event.exit)
-				IOLog("CarrizoRed: <- %s = 0x%x\n", event.name, event.value);
+				IOLog("UnifiedRed: <- %s = 0x%x\n", event.name, event.value);
 			else
-				IOLog("CarrizoRed: -> %s\n", event.name);
+				IOLog("UnifiedRed: -> %s\n", event.name);
 		}
 
 		// Interrupt activity since the last tick: a storm shows as a fast-climbing handler count.
@@ -4049,18 +4079,18 @@ void CRDriver::watcherThread(void *arg, wait_result_t) {
 			// Once the desktop runs, interrupts never stop: log them every 30 s, or when they storm.
 			uint32_t calls = __atomic_load_n(&ihHandlerCalls, __ATOMIC_RELAXED);
 			if (calls != lastCalls && (!desktopRunning() || tick % 60 == 0 || calls - lastCalls > 5000))
-				IOLog("CarrizoRed: IH handler calls %u (+%u), rptr writes %u, last rptr 0x%x\n", calls, calls - lastCalls,
+				IOLog("UnifiedRed: IH handler calls %u (+%u), rptr writes %u, last rptr 0x%x\n", calls, calls - lastCalls,
 					__atomic_load_n(&ihReadPointerWrites, __ATOMIC_RELAXED), ihLastReadPointer);
 			lastCalls = calls;
 		}
 
 		if (ihStormBroken && tick % 6 == 0) {
 			auto &snap = ihSnapshot;
-			IOLog("CarrizoRed: IH STORM broken at %llu ms after %u handler calls; ring in %s, size 0x%x\n", snap.ms,
+			IOLog("UnifiedRed: IH STORM broken at %llu ms after %u handler calls; ring in %s, size 0x%x\n", snap.ms,
 				snap.calls, snap.vram ? "VRAM" : "system memory", snap.size);
-			IOLog("CarrizoRed: IH RB_CNTL=%08x RB_BASE=%08x RPTR=%08x WPTR=%08x WPTR_ADDR=%02x:%08x CNTL=%08x STATUS=%08x\n",
+			IOLog("UnifiedRed: IH RB_CNTL=%08x RB_BASE=%08x RPTR=%08x WPTR=%08x WPTR_ADDR=%02x:%08x CNTL=%08x STATUS=%08x\n",
 				snap.rbCntl, snap.rbBase, snap.rptr, snap.wptr, snap.wptrAddrHi, snap.wptrAddrLo, snap.cntl, snap.status);
-			IOLog("CarrizoRed: IH write-back as CPU sees it=%08x at %llx; ring cpu %llx gpu %llx\n", snap.wbValue,
+			IOLog("UnifiedRed: IH write-back as CPU sees it=%08x at %llx; ring cpu %llx gpu %llx\n", snap.wbValue,
 				snap.wbAddress, snap.ringCpu, snap.ringGpu);
 		}
 
@@ -4069,7 +4099,7 @@ void CRDriver::watcherThread(void *arg, wait_result_t) {
 			static uint32_t regPrinted;
 			uint32_t regHead = __atomic_load_n(&regRingHead, __ATOMIC_RELAXED);
 			if (regHead - regPrinted > RegRingSize) {
-				IOLog("CarrizoRed: (%u queued register lines dropped)\n",
+				IOLog("UnifiedRed: (%u queued register lines dropped)\n",
 					regHead - regPrinted - static_cast<uint32_t>(RegRingSize));
 				regPrinted = regHead - static_cast<uint32_t>(RegRingSize);
 			}
@@ -4083,7 +4113,7 @@ void CRDriver::watcherThread(void *arg, wait_result_t) {
 
 		// Heartbeat once the register log is armed: shows whether register traffic continues up to a freeze.
 		if (regLogFromMs && tick % 4 == 0)
-			IOLog("CarrizoRed: hb t=%us regs %u ih %u missing-pipe %u pm %u cfgwr %u\n", t,
+			IOLog("UnifiedRed: hb t=%us regs %u ih %u missing-pipe %u pm %u cfgwr %u\n", t,
 				__atomic_load_n(&regAccesses, __ATOMIC_RELAXED), __atomic_load_n(&ihHandlerCalls, __ATOMIC_RELAXED),
 				__atomic_load_n(&pipeAccesses, __ATOMIC_RELAXED), __atomic_load_n(&pmEvents, __ATOMIC_RELAXED),
 				__atomic_load_n(&pciConfigWrites, __ATOMIC_RELAXED));
@@ -4095,10 +4125,12 @@ void CRDriver::watcherThread(void *arg, wait_result_t) {
 		if (breadcrumb)
 			writeBreadcrumb(t);
 		if (panicAt && t >= panicAt)
-			self->panicReport(t, now, "CarrizoRed: deliberate panic (crpanicat), the kernel was still running.");
+			self->panicReport(t, now, "UnifiedRed: deliberate panic (crpanicat), the kernel was still running.");
 		uvdLiveTick();
+		vceLiveTick();
+		uvdBridgeTick();
 		if (uvdPanicMs && uptimeMs() >= uvdPanicMs && !(uvdStartInfo.status & 2))
-			self->panicReport(t, now, "CarrizoRed: deliberate panic (-cruvdpanic), 20 s after the first UVD session.");
+			self->panicReport(t, now, "UnifiedRed: deliberate panic (-cruvdpanic), 20 s after the first UVD session.");
 		kickStalledFlip();
 		// GPU stopped: the GFX ring's read pointer (CP_RB0_RPTR) stuck behind its write pointer (CP_RB0_WPTR) for 10 s.
 		// The screen freezes with the kernel still running and nothing in NVRAM, so panic with the report instead.
@@ -4107,7 +4139,7 @@ void CRDriver::watcherThread(void *arg, wait_result_t) {
 			uint32_t rptr = gpuMmio[0x21C0], wptr = gpuMmio[0x3045];
 			if (rptr != wptr && rptr == stallRptr) {
 				if (++stallTicks == 20)
-					self->panicReport(t, now, "CarrizoRed: the GPU stopped executing commands (GFX ring read pointer stuck "
+					self->panicReport(t, now, "UnifiedRed: the GPU stopped executing commands (GFX ring read pointer stuck "
 						"for 10 s with work queued).");
 			} else {
 				stallTicks = 0;
@@ -4176,14 +4208,14 @@ void CRDriver::watcherThread(void *arg, wait_result_t) {
 		// 120 s, panic with the report. -crnoautopanic disables it.
 		if (t >= 120 && accelKextLoads[2] && !smuLoadOk() && !autoPanicOff)
 			self->panicReport(t, now, gpuDeadMs ?
-				"CarrizoRed: the GPU stopped responding (registers read 0xFFFFFFFF), so the accelerator couldn't start. "
+				"UnifiedRed: the GPU stopped responding (registers read 0xFFFFFFFF), so the accelerator couldn't start. "
 				"Not a driver bug: power the machine off fully (hold power, wait 10 s) before the next boot." :
-				"CarrizoRed: the accelerator didn't start (no SMU microcode load by 120 s).");
+				"UnifiedRed: the accelerator didn't start (no SMU microcode load by 120 s).");
 		if (__atomic_load_n(&smuStoppedAt, __ATOMIC_RELAXED))
-			self->panicReport(t, now, "CarrizoRed: SMU load stopped by crsmustep.");
+			self->panicReport(t, now, "UnifiedRed: SMU load stopped by crsmustep.");
 		if (auto *stage = __atomic_load_n(&stoppedStage, __ATOMIC_RELAXED)) {
 			static char reason[160];
-			snprintf(reason, sizeof(reason), "CarrizoRed: stopped on entering %s (#%u, crstopat).", stage, stopAtCount);
+			snprintf(reason, sizeof(reason), "UnifiedRed: stopped on entering %s (#%u, crstopat).", stage, stopAtCount);
 			self->panicReport(t, now, reason);
 		}
 
@@ -4200,7 +4232,7 @@ void CRDriver::watcherThread(void *arg, wait_result_t) {
 					(getKernelVersion() == KernelVersion::Catalina ? WatchdogMsCatalina : WatchdogMs);
 			if (stuck) {
 				static char reason[512];
-				size_t len = static_cast<size_t>(snprintf(reason, sizeof(reason), "%sCarrizoRed watchdog: open stages:",
+				size_t len = static_cast<size_t>(snprintf(reason, sizeof(reason), "%sUnifiedRed watchdog: open stages:",
 					gpuDeadMs ? "GPU NOT RESPONDING (power off fully). " : ""));
 				for (size_t i = 0; i < MaxTraceStages && len < sizeof(reason); i++)
 					if (__atomic_load_n(&stageOpen[i], __ATOMIC_RELAXED))
@@ -4256,7 +4288,7 @@ void CRDriver::watcherThread(void *arg, wait_result_t) {
 				self->iGPU->setProperty("LoadAMDSupport", true);
 				self->iGPU->setProperty("LoadController", true);
 				self->iGPU->registerService();
-				IOLog("CarrizoRed: t=%us set LoadController on the iGPU and re-registered it\n", t);
+				IOLog("UnifiedRed: t=%us set LoadController on the iGPU and re-registered it\n", t);
 				traceNote("LoadController@%us ", t);
 			}
 		}
@@ -4271,7 +4303,7 @@ void CRDriver::watcherThread(void *arg, wait_result_t) {
 				self->iGPU->setProperty("LoadHWServices", true);
 				self->iGPU->setProperty("LoadAccelerator", true);
 				self->iGPU->registerService();
-				IOLog("CarrizoRed: t=%us set LoadHWServices + LoadAccelerator on the iGPU and re-registered it\n", t);
+				IOLog("UnifiedRed: t=%us set LoadHWServices + LoadAccelerator on the iGPU and re-registered it\n", t);
 			}
 			traceNote("LoadAccelerator@%us%s ", t, already ? "(already)" : "");
 		}
@@ -4279,25 +4311,25 @@ void CRDriver::watcherThread(void *arg, wait_result_t) {
 		// Every 15 s, or when the tree changes: launchd keeps scrolling the console once the GUI starts.
 		if (print && (strcmp(now, last) || t % 15 == 0)) {
 			strlcpy(last, now, sizeof(last));
-			self->iGPU->setProperty("CarrizoRed,tree", now);
-			IOLog("CarrizoRed: t=%us LoadController=%s, iGPU children:%s\n", t,
+			self->iGPU->setProperty("UnifiedRed,tree", now);
+			IOLog("UnifiedRed: t=%us LoadController=%s, iGPU children:%s\n", t,
 				self->iGPU->getProperty("LoadController") ? "set" : "not set", now[0] ? "" : " none");
 			// Wrap the summary at spaces so a long line can't be overwritten by the next console line.
 			if (!traceSummary[0])
-				IOLog("CarrizoRed: trace: (controller not probed yet)\n");
+				IOLog("UnifiedRed: trace: (controller not probed yet)\n");
 			for (size_t pos = 0, len = strlen(traceSummary); pos < len;) {
 				size_t chunk = len - pos > 100 ? 100 : len - pos;
 				if (pos + chunk < len)
 					while (chunk > 1 && traceSummary[pos + chunk - 1] != ' ')
 						chunk--;
-				IOLog("CarrizoRed: trace: %.*s\n", static_cast<int>(chunk), traceSummary + pos);
+				IOLog("UnifiedRed: trace: %.*s\n", static_cast<int>(chunk), traceSummary + pos);
 				pos += chunk;
 			}
 			for (char *line = now; *line;) {
 				char *end = strchr(line, '\n');
 				if (end)
 					*end = '\0';
-				IOLog("CarrizoRed:   %s\n", line);
+				IOLog("UnifiedRed:   %s\n", line);
 				if (!end)
 					break;
 				line = end + 1;
@@ -4341,17 +4373,17 @@ void CRDriver::patchSupport(KernelPatcher &patcher, size_t index, mach_vm_addres
 // its writes out as the cause of the freeze ~20 s after start-up.
 bool CRDriver::wrapTestVram(void *that, uint32_t region, bool flag) {
 	if (checkKernelArgument("-crnovramwrite")) {
-		IOLog("CarrizoRed: TestVRAM(region %u) skipped (-crnovramwrite), reporting success\n", region);
+		IOLog("UnifiedRed: TestVRAM(region %u) skipped (-crnovramwrite), reporting success\n", region);
 		traceNote("TestVRAM(%u)=skipped ", region);
 		return true;
 	}
 	bool ret = FunctionCast(wrapTestVram, callback->orgTestVram)(that, region, flag);
-	IOLog("CarrizoRed: TestVRAM(region %u) -> %s, reporting success\n", region, ret ? "passed" : "FAILED");
+	IOLog("UnifiedRed: TestVRAM(region %u) -> %s, reporting success\n", region, ret ? "passed" : "FAILED");
 	traceNote("TestVRAM(%u)=%s->ok ", region, ret ? "pass" : "FAIL");
 	return true;
 }
 
-// aty_config options CarrizoRed overrides (all booleans), each with a boot-arg that leaves Apple's value alone.
+// aty_config options UnifiedRed overrides (all booleans), each with a boot-arg that leaves Apple's value alone.
 //  CFG_NON_ZERO_MC_LOC: see patchSupport.
 //  CFG_NO_PP: no PowerPlay. Apple's PowerPlay drives the Polaris SMU7 power controller; Stoney has an SMU8, which
 //  also controls the CPU and memory clocks. Spoof boots 5-7 froze the whole machine instantly as the GUI (and AGPM's
@@ -4753,7 +4785,7 @@ namespace {
 				IOSleep(1000);
 		}
 		if (stages[N].sync) {
-			IOLog("CarrizoRed: => %s\n", stages[N].name);
+			IOLog("UnifiedRed: => %s\n", stages[N].name);
 			IOSleep(30);
 		}
 		if (!strcmp(stages[N].name, "hw.setupCAIL")) {
@@ -5101,7 +5133,7 @@ void CRDriver::patchAccelerator(KernelPatcher &patcher, size_t index, mach_vm_ad
 		}
 		for (size_t i = 0; checks && checks[i]; i++) {
 			if (!codeHas(fn, checkLen, checks[i])) {
-				IOLog("CarrizoRed: accel: %s left alone, its code differs from the 15.8.1 KDK (%s)\n", what, checks[i]);
+				IOLog("UnifiedRed: accel: %s left alone, its code differs from the 15.8.1 KDK (%s)\n", what, checks[i]);
 				traceNote("%s=nomatch ", what);
 				accelGuardMisses++;
 				accelGuardMissLast = what;
@@ -5211,6 +5243,48 @@ void CRDriver::patchAccelerator(KernelPatcher &patcher, size_t index, mach_vm_ad
 		route("__ZN33AMDRadeonX4000_AMDAccelVCEContext4initEP37AMDRadeonX4000_AMDGraphicsAcceleratorP35AMDRadeonX4000_"
 			  "AMDAccelVideoContextP23sVideoContextCreateInfo",
 			reinterpret_cast<mach_vm_address_t>(wrapVceContextInit), orgVceContextInit, nullptr, 0, "VCE context init");
+		bool vceOn = checkKernelArgument("-crvce"), uvdOn = checkKernelArgument("-cruvd");
+		if (vceOn) {
+			route("__ZN28AMDRadeonX4000_AMDVCE3v4Ring9writeTailEv", reinterpret_cast<mach_vm_address_t>(wrapVceWriteTail),
+				orgVceWriteTail, nullptr, 0, "VCE writeTail");
+			route("__ZN28AMDRadeonX4000_AMDVCE3v4Ring7getHeadEv", reinterpret_cast<mach_vm_address_t>(wrapVceGetHead),
+				orgVceGetHead, nullptr, 0, "VCE getHead");
+		}
+		if (vceOn || uvdOn) {
+			// The VMID 0 bridge (VCE and UVD) books its GART window in Apple's GART allocator (vceBridgeInit).
+			route("__ZN24AMDRadeonX4000_AMDHWGart4initEP30AMDRadeonX4000_IAMDHWInterfaceP16_GART_PARAMETERS",
+				reinterpret_cast<mach_vm_address_t>(wrapGartInit), orgGartInit, nullptr, 0, "GART init");
+			// The ring life cycle, logged for the two VCE ring classes only (by vtable). Polaris hardware (AMDBaffinHardware,
+			// AMDEllesmereHardware::allocateHWEngines) makes an AMDVCE3v4HWEngine with AMDVCE3v4Ring/LLQRing, not the
+			// AMDVIVCE* classes 754d92a watched (none of its hooks ran). UVD decode: AMDUVD6v3DecRing.
+			auto vt = patcher.solveSymbol(index, "__ZTV28AMDRadeonX4000_AMDVCE3v4Ring", slide, size);
+			auto vtLlq = patcher.solveSymbol(index, "__ZTV31AMDRadeonX4000_AMDVCE3v4LLQRing", slide, size);
+			auto vtUvd = patcher.solveSymbol(index, "__ZTV31AMDRadeonX4000_AMDUVD6v3DecRing", slide, size);
+			patcher.clearError();
+			if (vtUvd && uvdOn)
+				uvdDecRingVtable = vtUvd + 16;
+			if (vt && vtLlq) {
+				if (vceOn) {
+					vceRingVtable = vt + 16;
+					vceLlqRingVtable = vtLlq + 16;
+					route("__ZN28AMDRadeonX4000_AMDVCE3v4Ring16registerLocationEv",
+						reinterpret_cast<mach_vm_address_t>(wrapVceRegLoc), orgVceRegLoc, nullptr, 0, "VCE registerLocation");
+					route("__ZN31AMDRadeonX4000_AMDVCE3v4LLQRing16registerLocationEv",
+						reinterpret_cast<mach_vm_address_t>(wrapVceLlqRegLoc), orgVceLlqRegLoc, nullptr, 0,
+						"VCE LLQ registerLocation");
+				}
+				routeAllowJcc = true;
+				route("__ZN24AMDRadeonX4000_AMDHWRing6enableEv", reinterpret_cast<mach_vm_address_t>(wrapRingEnable),
+					orgRingEnable, nullptr, 0, "ring enable");
+				route("__ZN24AMDRadeonX4000_AMDHWRing7disableEv", reinterpret_cast<mach_vm_address_t>(wrapRingDisable),
+					orgRingDisable, nullptr, 0, "ring disable");
+				route("__ZN24AMDRadeonX4000_AMDHWRing6submitEv", reinterpret_cast<mach_vm_address_t>(wrapRingSubmit),
+					orgRingSubmit, nullptr, 0, "ring submit");
+				route("__ZN24AMDRadeonX4000_AMDHWRing18flushWithoutSubmitEv",
+					reinterpret_cast<mach_vm_address_t>(wrapRingFlush), orgRingFlush, nullptr, 0, "ring flush");
+				routeAllowJcc = false;
+			}
+		}
 		route("__ZN29AMDRadeonX4000_AMDUVDHWEngine5startEv", reinterpret_cast<mach_vm_address_t>(wrapUvdStart),
 			orgUvdStart, nullptr, 0, "UVD start");
 		route("__ZN37AMDRadeonX4000_AMDGraphicsAccelerator29addPlistPropertiesToPCIDeviceEPKc",
@@ -5708,9 +5782,10 @@ namespace Smu8 {
 	static constexpr uint32_t JobListEntries = 32;                                     // NUM_JOBLIST_ENTRIES
 	static constexpr uint16_t EndOfTaskList = 0xFFFF;
 	// Region layout: TOC, the scratch buffers (Linux smu_buffer), then the images, 4 KB aligned; then the IH ring and its
-	// write-back word (see moveIhRing).
+	// write-back word (see moveIhRing); then VCE's shadow page directory (see vcePrependPtb).
 	static constexpr uint32_t TocOffset = 0, ScratchOffset = 0x1000, UcodeOffset = 0x5000, IhOffset = 0x60000,
-	                          IhMaxSize = 0x40000, RegionSize = IhOffset + IhMaxSize + 0x1000;
+	                          IhMaxSize = 0x40000, VcePdOffset = IhOffset + IhMaxSize + 0x1000, VcePdSize = 0x4000,
+	                          RegionSize = VcePdOffset + VcePdSize;
 	struct Task {  // SMU_Task
 		uint8_t type, arg;
 		uint16_t next;
@@ -6301,6 +6376,7 @@ static bool wrapUvdStart(void *that) {
 	}
 	if (gpuMmio && videoPowered())
 		uvdPowerTilesUp();
+	vceBridgeForget();
 	bool ret = FunctionCast(wrapUvdStart, orgUvdStart)(that);
 	if (!gpuMmio)
 		return ret;
@@ -6318,6 +6394,29 @@ static bool wrapUvdStart(void *that) {
 	info.ms = uptimeMs();
 	diskLogEvent("uvd start #%u = %d: status %x vcpu %x reset %x lmi %x tile1 %x", info.calls, ret, status, info.vcpu,
 		info.reset, info.lmi, info.tile);
+	// For loading Stoney's firmware (linux-firmware stoney_uvd.bin 1.43, ucode 0x439e0 bytes; Linux copies it to the
+	// VCPU buffer's start, window 0 from +256): what Apple set up. Engine +0x160 CPU address and +0x128 size of the
+	// firmware memory (loadUVDFW), the cache BAR, windows 0-2 (offsets in 8-byte units), and the image's first dwords.
+	if (info.calls <= 2) {
+		auto *e = static_cast<uint8_t *>(that);
+		auto *fwCpu = *reinterpret_cast<uint32_t **>(e + 0x160);
+		uint32_t fwSize = *reinterpret_cast<uint32_t *>(e + 0x128);
+		auto *m = gpuMmio;
+		uint64_t bar = static_cast<uint64_t>(m[0x3C5E]) << 32 | m[0x3C5F];
+		char head[200];
+		size_t p = 0;
+		for (uint32_t i = 0; fwCpu && i < 8 && p + 12 < sizeof(head); i++)
+			p += snprintf(head + p, sizeof(head) - p, " %x", fwCpu[i]);
+		char at[200];
+		p = 0;
+		uint32_t off0 = m[0x3D82] << 3;
+		for (uint32_t i = 0; fwCpu && off0 + 32 <= fwSize && i < 8 && p + 12 < sizeof(at); i++)
+			p += snprintf(at + p, sizeof(at) - p, " %x", fwCpu[off0 / 4 + i]);
+		diskLogEvent("uvd fw: memory cpu %p size %x (+0x138 %llx +0x168 %llx); cache bar %llx, windows %x/%x %x/%x %x/%x "
+			"(byte offset/size); image at 0:%s; at window 0:%s", fwCpu, fwSize, *reinterpret_cast<uint64_t *>(e + 0x138),
+			*reinterpret_cast<uint64_t *>(e + 0x168), bar, off0, m[0x3D83], m[0x3D84] << 3, m[0x3D85], m[0x3D86] << 3,
+			m[0x3D87], head, at);
+	}
 	traceNote("uvd.start=%d/%x ", ret, status);
 	if (ret && !(status & 2) && !checkKernelArgument("-crnouvdfwcheck")) {
 		uvdState = 3;
@@ -6430,6 +6529,776 @@ static bool wrapVceContextInit(void *that, void *accel, void *videoContext, uint
 	}
 	bool ret = FunctionCast(wrapVceContextInit, orgVceContextInit)(that, accel, videoContext, createInfo);
 	traceNote("vid.vceInit=%d ", ret);
+	return ret;
+}
+
+// VCE with -crvce on Monterey (2026-11-07, log 1747067949): CAIL's Stoney table already uses Cail_Ellesmere_VceInit
+// (the VCE 3.4 one), the firmware boots (VCE_STATUS 22, VCPU_CNTL 100001, soft reset clear), Apple writes 0x20 bytes to
+// the LLQ ring, and its read pointer never moves: "channel 10 event timeout on stamp 1". Apple's AMDVCE3v4Ring (same code as AMDVIVCERing) programs
+// ring 1 at VCE_RB_BASE_LO/HI/SIZE/RPTR/WPTR 0x8060-0x8064 and the LLQ ring at 0x805B-0x805F, each under
+// GRBM_GFX_INDEX 7 (VCE instance 0, all pipes) as Linux's vce_v3_0 does. What the hardware holds then isn't known (the
+// sample reads ring 1 only, without the instance select), so after AMDVCE3v4Ring's writeTail and getHead (which it polls while
+// waiting), select the instance the same way, read both rings, the VCPU cache set-up and the LMI, and the first dwords
+// of each ring through the GART.
+static const uint16_t vceRegs[] {0x8001, 0x8005, 0x8009, 0x800A, 0x800B, 0x800C, 0x800D, 0x800E, 0x8048, 0x805B,
+	0x805C, 0x805D, 0x805E, 0x805F, 0x8060, 0x8061, 0x8062, 0x8063, 0x8064, 0x85A6, 0x85A7, 0x85A8, 0x8616, 0x8617,
+	0x8618, 0x859D, 0x85AD, 0x85AE, 0x85B5, 0x85BD};
+static struct {
+	uint64_t ms;
+	uint32_t tails, heads, logged, regs[arrsize(vceRegs)], ring[2][24];
+	bool ringRead[2];
+} vceLive;
+// The ring 1 fence probe (vceFenceProbe).
+static void *vceRing1;
+static uint32_t vceProbeState;  // 0 not sent, 1 sent, 2 not possible
+static constexpr uint32_t VceProbeValue = 0xCAFE0001;
+static uint64_t vceProbeGart;  // the second probe fence, in ring 1's GART pages
+static uint32_t vceRing1Vm7State;  // the swap's VMID 7 copy on ring 1: 0 not sent, 1 sent, 2 failed
+static uint32_t vceOwnVmid;  // the probe's own-page-table VMID (base register restored by the watcher), 0 none
+static uint64_t vceOwnMs;
+static uint64_t vceRing1Mc;  // ring 1's GART address (VCE_RB_BASE), from the probe
+static uint32_t vceVariantsSent;  // the bridge's create IB variants on ring 1 (fences +0x110.. in our region)
+
+static bool gartRead(uint64_t addr, uint32_t *out, uint32_t bytes) {
+	auto *m = gpuMmio;
+	uint64_t table = static_cast<uint64_t>(m[0x54F]) << 12, start = static_cast<uint64_t>(m[0x557]) << 12;
+	uint64_t carveout = static_cast<uint64_t>(m[Reg::MC_VM_FB_OFFSET] & 0x3FFFF) << 22;
+	if (!table || !start || addr < start || (addr & 0xFFF) + bytes > 0x1000)
+		return false;
+	auto readPhys = [](uint64_t phys, uint32_t len, void *dst) {
+		if (!physRangeOk(phys, len))
+			return false;
+		auto *desc = IOMemoryDescriptor::withPhysicalAddress(phys, len, kIODirectionIn);
+		auto *map = desc ? desc->map(kIOMapInhibitCache) : nullptr;
+		if (map)
+			memcpy(dst, reinterpret_cast<const void *>(map->getVirtualAddress()), len);
+		bool ok = map != nullptr;
+		OSSafeReleaseNULL(map);
+		OSSafeReleaseNULL(desc);
+		return ok;
+	};
+	uint64_t pte = 0;
+	if (!readPhys(carveout + table + ((addr - start) >> 12) * 8, sizeof(pte), &pte) || !(pte & 1))
+		return false;
+	return readPhys((pte & 0xFFFFFFFFF000ULL) | (addr & 0xFFF), bytes, out);
+}
+
+// The GART (VM context 0) page table entry for a GART address, as the hardware reads it (table in the carve-out).
+static uint64_t gartPte(uint64_t addr) {
+	auto *m = gpuMmio;
+	uint64_t table = static_cast<uint64_t>(m[0x54F]) << 12, start = static_cast<uint64_t>(m[0x557]) << 12;
+	uint64_t carveout = static_cast<uint64_t>(m[Reg::MC_VM_FB_OFFSET] & 0x3FFFF) << 22;
+	uint64_t phys = carveout + table + ((addr - start) >> 12) * 8, pte = 0;
+	if (!table || !start || addr < start)
+		return 0;
+	auto *p = carvePtr(phys, 8);
+	if (p)
+		memcpy(&pte, p, 8);
+	return pte;
+}
+
+static void vceSnapshot(const char *why) {
+	auto *m = gpuMmio;
+	if (!m || !videoPowered())
+		return;
+	auto &s = vceLive;
+	uint32_t old[arrsize(vceRegs)];
+	memcpy(old, s.regs, sizeof(old));
+	m[0xC200] = 7;
+	for (size_t i = 0; i < arrsize(vceRegs); i++)
+		s.regs[i] = m[vceRegs[i]];
+	m[0xC200] = 0xE0000000;
+	s.ms = uptimeMs();
+	if (s.logged >= 24 || !memcmp(old, s.regs, sizeof(old)))
+		return;
+	s.logged++;
+	char buf[560];
+	size_t len = 0;
+	for (size_t i = 0; i < arrsize(vceRegs) && len + 16 < sizeof(buf); i++)
+		len += snprintf(buf + len, sizeof(buf) - len, " %x=%x", vceRegs[i], s.regs[i]);
+	diskLogEvent("vce %s (tails %u heads %u):%s", why, s.tails, s.heads, buf);
+}
+
+// From the watcher (the hooks may run under Apple's locks): the first dwords of each ring, read through the GART at
+// the base the last snapshot saw (ring 1 BASE 0x8060/0x8061 = regs 14/15, LLQ 0x805B/0x805C = regs 9/10), logged when
+// they change.
+static void vceLiveTick() {
+	auto &s = vceLive;
+	auto *m = gpuMmio;
+	if (!s.tails || !m || !videoPowered())
+		return;
+	static const size_t bases[2][2] {{14, 15}, {9, 10}};
+	static uint32_t ringLogs, ibLogs, fenceLogs, fenceLast[2];
+	static uint64_t fenceAddr;
+	static uint32_t probeLogs, probeLast = 1;
+	if (vceProbeState == 1 && probeLogs < 6) {
+		auto *t = carvePtr(smuLoad.phys + Smu8::VcePdOffset, 8);
+		uint32_t v = t ? *reinterpret_cast<volatile uint32_t *>(t) : 0xFFFFFFFF;
+		if (v != probeLast) {
+			probeLast = v;
+			probeLogs++;
+			m[0xC200] = 7;
+			uint32_t r1 = m[0x8063], w1 = m[0x8064];
+			m[0xC200] = 0xE0000000;
+			diskLogEvent("vce probe: fence dword now %x (%s); ring 1 rptr %x wptr %x, VCE_STATUS %x", v,
+				v == VceProbeValue ? "the firmware ran it" : "not written", r1, w1, m[0x8001]);
+		}
+	}
+	static uint32_t ibProbeLogs, ibProbeLast = 1;
+	if (vceProbeState == 1 && ibProbeLogs < 4) {
+		auto *r = carvePtr(smuLoad.phys + Smu8::VcePdOffset, 0x3000);
+		uint32_t v = r ? *reinterpret_cast<volatile uint32_t *>(r + 0x100) : 0xFFFFFFFF;
+		if (r && v != ibProbeLast) {
+			ibProbeLast = v;
+			ibProbeLogs++;
+			auto *fb = reinterpret_cast<volatile uint32_t *>(r + 0x2000);
+			diskLogEvent("vce probe: Linux create-session IB fence now %x (%s); feedback %x %x %x %x %x %x %x %x", v,
+				v == VceProbeValue + 2 ? "the session ran" : "not written", fb[0], fb[1], fb[2], fb[3], fb[4], fb[5],
+				fb[6], fb[7]);
+		}
+	}
+	// The VM protection fault latches (gmc_8_1_d.h): context 0 at 0x536 status / 0x538 client / 0x53E page, contexts
+	// 1-15 at 0x537 / 0x539 / 0x53F. Until b9449e9 the "VM_CONTEXT1" line read context 0's. Status: protections 7:0,
+	// client ID 20:12, write 24, VMID 28:25; the client register holds 4 ASCII characters. Who faulted where. Logged when either changes once VCE ran.
+	static uint32_t vmFaultLogs, vmFaultLast[2];
+	if (vceProbeState && vmFaultLogs < 12) {
+		uint32_t st0 = m[0x536], st1 = m[0x537];
+		if (st0 != vmFaultLast[0] || st1 != vmFaultLast[1]) {
+			vmFaultLast[0] = st0;
+			vmFaultLast[1] = st1;
+			vmFaultLogs++;
+			uint32_t c0 = m[0x538], c1 = m[0x539];
+			auto ch = [](uint32_t v, int i) {
+				char c = static_cast<char>((v >> (24 - 8 * i)) & 0xFF);
+				return c >= 0x20 && c < 0x7F ? c : '.';
+			};
+			diskLogEvent("vm fault: ctx0 status %x page %x client %x (%c%c%c%c); ctx1-15 status %x (vmid %u) page %x "
+				"(va %llx) client %x (%c%c%c%c)", st0, m[0x53E], c0, ch(c0, 0), ch(c0, 1), ch(c0, 2), ch(c0, 3), st1,
+				(st1 >> 25) & 0xF, m[0x53F], static_cast<uint64_t>(m[0x53F]) << 12, c1, ch(c1, 0), ch(c1, 1), ch(c1, 2),
+				ch(c1, 3));
+		}
+	}
+	static uint32_t variantLogs, variantLast[3] {1, 1, 1};
+	if (vceVariantsSent == 2 && variantLogs < 9) {
+		auto *r = carvePtr(smuLoad.phys + Smu8::VcePdOffset, 0x3000);
+		static const char *const without[3] {"hw config, clock table, aux", "hw config, clock table", "hw config"};
+		for (uint32_t v = 0; r && v < 3; v++) {
+			uint32_t val = *reinterpret_cast<volatile uint32_t *>(r + 0x110 + v * 4);
+			if (val == variantLast[v])
+				continue;
+			variantLast[v] = val;
+			variantLogs++;
+			diskLogEvent("vce variant %u (Apple's create IB without %s) fence now %x (%s)", v + 7, without[v], val,
+				val == VceProbeValue + 6 + v ? "the session ran" : "not written");
+		}
+	}
+	static uint32_t ownProbeLogs, ownProbeLast = 1;
+	if (vceOwnVmid && ownProbeLogs < 4) {
+		auto *r = carvePtr(smuLoad.phys + Smu8::VcePdOffset, 0x3000);
+		uint32_t v = r ? *reinterpret_cast<volatile uint32_t *>(r + 0x10C) : 0xFFFFFFFF;
+		if (r && v != ownProbeLast) {
+			ownProbeLast = v;
+			ownProbeLogs++;
+			diskLogEvent("vce probe: own page table (vmid %u, Apple's layout, GART pte) fence now %x (%s); base reg %x",
+				vceOwnVmid, v, v == VceProbeValue + 5 ? "VCE VMIDs work: Apple's VMID 7 tables differ" : "not written",
+				m[0x50E + vceOwnVmid - 8]);
+		}
+	}
+	// Put the borrowed VMID's base back (UPDATE_PTB wrote it), 2 s on.
+	if (vceOwnVmid && vceOwnMs && uptimeMs() > vceOwnMs + 2000) {
+		m[0x50E + vceOwnVmid - 8] = 0;
+		vceOwnMs = 0;
+	}
+	// Apple's VMID 7 PTE for its IB page next to the GART PTE VCE reads fine: flags (bits 11:0) and address.
+	static bool pteLogged;
+	if (!pteLogged && vceProbeState == 1 && vceRing1Vm7State) {
+		pteLogged = true;
+		uint32_t flags = 0;
+		uint64_t pde = 0;
+		uint64_t ibVa = (static_cast<uint64_t>(m[0x558]) << 12) + 0x300;  // Apple's first IB: VM start + 0x300
+		uint64_t phys = vmWalkInfo(7, ibVa, &flags, &pde);
+		uint64_t ring1 = static_cast<uint64_t>(s.regs[15]) << 32 | s.regs[14];
+		diskLogEvent("vce pte: vmid 7 va %llx -> phys %llx flags %x (PDE0 %llx); GART probe pte %llx", ibVa, phys, flags,
+			pde, gartPte(ring1 + 0x10000));
+	}
+	static uint32_t vm7ProbeLogs, vm7ProbeLast = 1;
+	if (vceRing1Vm7State == 1 && vm7ProbeLogs < 4) {
+		auto *r = carvePtr(smuLoad.phys + Smu8::VcePdOffset, 0x3000);
+		uint32_t v = r ? *reinterpret_cast<volatile uint32_t *>(r + 0x108) : 0xFFFFFFFF;
+		if (r && v != vm7ProbeLast) {
+			vm7ProbeLast = v;
+			vm7ProbeLogs++;
+			diskLogEvent("vce probe: VMID 7 create IB on ring 1 fence now %x (%s)", v,
+				v == VceProbeValue + 4 ? "VMID 7 works on ring 1" : "not written");
+		}
+	}
+	static uint32_t sysProbeLogs, sysProbeLast = 1;
+	if (vceProbeState == 1 && sysProbeLogs < 4) {
+		auto *r = carvePtr(smuLoad.phys + Smu8::VcePdOffset, 0x3000);
+		uint32_t v = r ? *reinterpret_cast<volatile uint32_t *>(r + 0x104) : 0xFFFFFFFF;
+		if (r && v != sysProbeLast) {
+			sysProbeLast = v;
+			sysProbeLogs++;
+			diskLogEvent("vce probe: sysmem create IB (VMID 0, GART) fence now %x (%s)", v,
+				v == VceProbeValue + 3 ? "VCE reads system memory: VMID 7 is the problem" : "not written");
+		}
+	}
+	static uint32_t gartProbeLogs, gartProbeLast = 1;
+	if (vceProbeState == 1 && vceProbeGart && gartProbeLogs < 4) {
+		uint32_t v[2] {};
+		if (gartRead(vceProbeGart, v, sizeof(v)) && v[0] != gartProbeLast) {
+			gartProbeLast = v[0];
+			gartProbeLogs++;
+			diskLogEvent("vce probe: gart fence %llx now %x (%s)", vceProbeGart, v[0],
+				v[0] == VceProbeValue + 1 ? "written through the GART" : "not written");
+		}
+	}
+	// The session IB's feedback buffer (0x05000005, VA 4:00020000 in log 1747201272): where the firmware reports
+	// a task's status. Logged when it changes.
+	static uint32_t fbLogs, fbLast[16];
+	static uint64_t fbVa;
+	static uint32_t fbVmid;
+	if (fbVa && fbLogs < 6) {
+		uint32_t fb[16] {};
+		uint64_t phys = ibVaToPhys(fbVmid, fbVa);
+		if (phys && ibReadPhys(phys, sizeof(fb), fb, false) && memcmp(fb, fbLast, sizeof(fb))) {
+			memcpy(fbLast, fb, sizeof(fb));
+			fbLogs++;
+			char buf[200];
+			size_t len = 0;
+			for (size_t i = 0; i < arrsize(fb) && len + 12 < sizeof(buf); i++)
+				len += snprintf(buf + len, sizeof(buf) - len, " %x", fb[i]);
+			diskLogEvent("vce feedback %llx:%s", fbVa, buf);
+		}
+	}
+	if (fenceAddr && fenceLogs < 8) {
+		uint32_t v[2] {};
+		if (gartRead(fenceAddr, v, sizeof(v)) && (v[0] != fenceLast[0] || v[1] != fenceLast[1])) {
+			fenceLast[0] = v[0];
+			fenceLast[1] = v[1];
+			fenceLogs++;
+			diskLogEvent("vce fence %llx now %x %x; VCE_STATUS %x LLQ rptr %x wptr %x", fenceAddr, v[0], v[1], m[0x8001],
+				s.regs[12], s.regs[13]);
+		}
+	}
+	for (size_t r = 0; r < 2; r++) {
+		uint32_t ring[24] {};
+		if (!gartRead(static_cast<uint64_t>(s.regs[bases[r][1]]) << 32 | s.regs[bases[r][0]], ring, sizeof(ring)))
+			continue;
+		if (s.ringRead[r] && !memcmp(ring, s.ring[r], sizeof(ring)))
+			continue;
+		memcpy(s.ring[r], ring, sizeof(ring));
+		s.ringRead[r] = true;
+		if (ringLogs++ < 16) {
+			char buf[260];
+			size_t len = 0;
+			for (size_t i = 0; i < arrsize(ring) && len + 12 < sizeof(buf); i++)
+				len += snprintf(buf + len, sizeof(buf) - len, " %x", ring[i]);
+			diskLogEvent("vce ring %s:%s", r ? "llq" : "1", buf);
+		}
+		// The first block's IB (IB_VM at dword 0, or 6 after our UPDATE_PTB/FLUSH_TLB/END) and fence: what the firmware
+		// was given, read through Apple's own page tables, and whether the fence was written. With the VM layout the
+		// firmware has to walk (VM_CONTEXT1_CNTL depth/block size, VM_CONTEXT1 start/end, the VMID's directory).
+		size_t at = ring[0] == 0x102 ? 0 : ring[6] == 0x102 ? 6 : 24;
+		if (at + 9 > arrsize(ring) || ibLogs >= 6)
+			continue;
+		ibLogs++;
+		uint32_t vmid = ring[at + 1] & 0xF;
+		uint64_t va = static_cast<uint64_t>(ring[at + 3]) << 32 | ring[at + 2];
+		uint64_t fence = static_cast<uint64_t>(ring[at + 7]) << 32 | ring[at + 6];
+		uint64_t phys = ibVaToPhys(vmid, va);
+		uint32_t ib[96] {}, fenceVal[2] {0xFFFFFFFF, 0xFFFFFFFF};
+		bool ibOk = phys && ibReadPhys(phys, sizeof(ib), ib, false);
+		bool fenceOk = gartRead(fence, fenceVal, sizeof(fenceVal));
+		if (fenceOk && !fenceAddr) {
+			fenceAddr = fence;
+			fenceLast[0] = fenceVal[0];
+			fenceLast[1] = fenceVal[1];
+		}
+		diskLogEvent("vce vm: cntl %x start %x end %x pdb%u %x; ib va %llx -> phys %llx%s; fence %llx = %x %x%s; "
+			"fault ctx0 status %x addr %x, ctx1-15 status %x addr %x client %x", m[0x505], m[0x558], m[0x560], vmid,
+			vmid < 8 ? m[0x54F + vmid] : m[0x50E + vmid - 8], va, phys, ibOk ? "" : " (unread)", fence, fenceVal[0],
+			fenceVal[1], fenceOk ? "" : " (unread)", m[0x536], m[0x53E], m[0x537], m[0x53F], m[0x539]);
+		if (ibOk) {
+			uint32_t dw = ring[at + 4] < arrsize(ib) ? ring[at + 4] : static_cast<uint32_t>(arrsize(ib));
+			for (uint32_t part = 0; part < dw; part += 32) {
+				char buf[400];
+				size_t len = 0;
+				for (uint32_t i = part; i < dw && i < part + 32 && len + 12 < sizeof(buf); i++)
+					len += snprintf(buf + len, sizeof(buf) - len, " %x", ib[i]);
+				diskLogEvent("vce ib +%u:%s", part, buf);
+			}
+			// The feedback buffer: the IB's 0x05000005 packet (size, id, address hi, lo, ...).
+			for (uint32_t i = 0; i + 3 < dw;) {
+				uint32_t len = ib[i];
+				if (len < 8 || len % 4 || i + len / 4 > dw)
+					break;
+				if (ib[i + 1] == 0x05000005 && !fbVa) {
+					fbVa = static_cast<uint64_t>(ib[i + 2]) << 32 | ib[i + 3];
+					fbVmid = vmid;
+				}
+				i += len / 4;
+			}
+		}
+	}
+}
+
+static void wrapVceWriteTail(void *that) {
+	FunctionCast(wrapVceWriteTail, orgVceWriteTail)(that);
+	vceLive.tails++;
+	vceSnapshot("tail");
+}
+
+// Which VCE ring an AMDHWRing is (0 none, 1 ring 1, 2 LLQ), and its state: enabled (+0x70), head (+0x50), tail
+// (+0x54), last submitted tail (+0x74) on Monterey's layout.
+static uint32_t vceRingKind(void *that) {
+	auto vptr = that ? *reinterpret_cast<mach_vm_address_t *>(that) : 0;
+	return vptr && vptr == vceRingVtable ? 1 : vptr && vptr == vceLlqRingVtable ? 2 : 0;
+}
+
+static void vceRingLog(const char *what, void *that, uint32_t kind, uint64_t ret) {
+	static uint32_t logs;
+	if (logs++ >= 48)
+		return;
+	auto *b = static_cast<uint8_t *>(that);
+	diskLogEvent("vce %s %s: ret %llx enabled %u head %x tail %x submitted %x", kind == 2 ? "llq" : "ring1", what, ret,
+		b[0x70], *reinterpret_cast<uint32_t *>(b + 0x50), *reinterpret_cast<uint32_t *>(b + 0x54),
+		*reinterpret_cast<uint32_t *>(b + 0x74));
+}
+
+static bool wrapRingEnable(void *that) {
+	auto kind = vceRingKind(that);
+	if (kind == 1) {
+		vceRing1 = that;
+		vceBridgeForget();  // a VCE (re)start
+	}
+	bool ret = FunctionCast(wrapRingEnable, orgRingEnable)(that);
+	if (kind)
+		vceRingLog("enable", that, kind, ret);
+	return ret;
+}
+
+static void wrapRingDisable(void *that) {
+	auto kind = vceRingKind(that);
+	FunctionCast(wrapRingDisable, orgRingDisable)(that);
+	if (kind)
+		vceRingLog("disable", that, kind, 0);
+}
+
+// VCE's page tables (log 1747070946, 40ce1f5): the firmware boots, Apple's LLQ submit reaches the hardware (WPTR2 0x20)
+// and the read pointer never moves. The block Apple writes (AMDVCE3v4Channel::commitIndirectCommandBuffer: a 0x20-dword
+// template with fields filled in) is VCE_CMD_IB_VM (0x102), vmid, IB address lo/hi, length, then VCE_CMD_FENCE (3),
+// fence lo/hi, sequence, and the template's tail. Nothing sends the firmware the VMID's page directory. Linux's
+// vce_v3_0 VM mode (Stoney and Polaris alike) emits, before every IB, VCE_CMD_UPDATE_PTB (0x107), vmid, page directory
+// >> 12, then VCE_CMD_FLUSH_TLB (0x108), vmid, VCE_CMD_END (1) (vce_v3_0_emit_vm_flush). So before the submit
+// (before writeTail), rewrite each new IB_VM block in place to start with those six dwords, the page directory being
+// that VMID's VM_CONTEXTn_PAGE_TABLE_BASE_ADDR (already in 4 KB units). Monterey's AMDCommandRing layout: +0x40 CPU
+// base, +0x30 size in dwords, +0x54 tail, +0x74 last submitted tail (dwords). -crnovceptb leaves the blocks alone.
+static uint32_t vcePtbRewrites, vcePtbSkips;
+
+// The page directory the firmware gets (log 1747198949, 2a4fc73): with UPDATE_PTB the firmware consumed the block, but
+// the fence was never written and no VM fault was raised. Apple's VM starts at VM_CONTEXT1_PAGE_TABLE_START_ADDR
+// 0x400000 (VA 16 GB; the IB is at 4:00000300) where Linux's starts at 0, the only layout the firmware's own walk has
+// met. If it indexes the directory by the VA alone, it reads entry 64 for Apple's entry 0. So hand it a shadow
+// directory in our VRAM region (Smu8::VcePdOffset): (start >> entry shift) empty entries, then a copy of Apple's
+// entries, which keep pointing at Apple's page tables. Refreshed on every submit.
+// Disproved (log 1747199769, efa72c3): UPDATE_PTB makes the firmware write VM_CONTEXTn_PAGE_TABLE_BASE_ADDR itself
+// (VMID 7's base read back as the shadow), so VCE uses the memory controller's VM, which handles the start address;
+// and the shadow then replaced the base the graphics side uses for that VMID. Only with -crvceshadow now.
+static uint32_t vceShadowBuilds, vceShadowFails;
+
+static uint32_t vceShadowPd(uint32_t applePd) {
+	static int off = -1;
+	if (off < 0)
+		off = checkKernelArgument("-crvceshadow") ? 0 : 1;
+	auto *m = gpuMmio;
+	if (off || !m || !smuLoad.mc || !smuLoad.phys)
+		return applePd;
+	uint32_t cntl = m[0x505], start = m[0x558], end = m[0x560];
+	uint32_t shift = 12 + 9 + ((cntl >> 24) & 0xF);  // VA bits per directory entry (two-level tables)
+	uint64_t startVa = static_cast<uint64_t>(start) << 12, span = (static_cast<uint64_t>(end) - start + 1) << 12;
+	uint64_t skip = startVa >> shift, entries = span >> shift;
+	if (((cntl >> 1) & 3) != 1 || (startVa & ((1ULL << shift) - 1)) || !entries ||
+		(skip + entries) * 8 > Smu8::VcePdSize) {
+		if (vceShadowFails++ < 4)
+			diskLogEvent("vce shadow: layout not handled (cntl %x start %x end %x)", cntl, start, end);
+		return applePd;
+	}
+	uint64_t applePhys = ibMcToPhys(static_cast<uint64_t>(applePd) << 12, false);
+	auto *src = carvePtr(applePhys, static_cast<uint32_t>(entries * 8));
+	auto *dst = carvePtr(smuLoad.phys + Smu8::VcePdOffset, Smu8::VcePdSize);
+	if (!src || !dst) {
+		if (vceShadowFails++ < 4)
+			diskLogEvent("vce shadow: no mapping (apple pd phys %llx)", applePhys);
+		return applePd;
+	}
+	memset(dst, 0, static_cast<size_t>(skip * 8));
+	memcpy(dst + skip * 8, src, static_cast<size_t>(entries * 8));
+	uint32_t shadow = static_cast<uint32_t>((smuLoad.mc + Smu8::VcePdOffset) >> 12);
+	if (vceShadowBuilds++ < 4)
+		diskLogEvent("vce shadow: %llu empty + %llu entries (shift %u) at mc %llx for pd %x; entry 0 %llx", skip, entries,
+			shift, smuLoad.mc + Smu8::VcePdOffset, applePd, *reinterpret_cast<uint64_t *>(src));
+	return shadow;
+}
+
+// Does the firmware run commands at all? (log 1747199769: it consumes the LLQ block, VCE_STATUS cycles 2 / 22 =
+// VCPU_REPORT 1 / 0x11 with JOB_BUSY and UENC_BUSY clear, no fence.) Before Apple's first LLQ submit, put a lone
+// VCE_CMD_FENCE (VMID 0, to a dword of our VRAM region, value 0xCAFE0001) and VCE_CMD_END on ring 1, which Apple leaves
+// idle, at its tail, moving Apple's tail and submitted marks with it, and bump its write pointer under the instance
+// select. The watcher reads the dword back. -crnovceprobe leaves ring 1 alone.
+
+static void vceFenceProbe() {
+	auto *m = gpuMmio;
+	if (vceProbeState || !m || !smuLoad.mc)
+		return;
+	// The probes' work is done (fbf8a3a log 1747556980: 38 s screen recording through the bridge). They sent three
+	// Linux test sessions before Apple's at every VCE start and borrowed VMID 15: -crvceprobe only. State 2 keeps the
+	// VM fault log (it runs once VCE has started).
+	if (!checkKernelArgument("-crvceprobe")) {
+		vceProbeState = 2;
+		return;
+	}
+	auto *b = static_cast<uint8_t *>(vceRing1);
+	auto *target = carvePtr(smuLoad.phys + Smu8::VcePdOffset, 8);
+	if (!b || !target) {
+		vceProbeState = 2;
+		return;
+	}
+	auto *ring = *reinterpret_cast<uint32_t **>(b + 0x40);
+	auto &size = *reinterpret_cast<uint32_t *>(b + 0x30);
+	auto &tail = *reinterpret_cast<uint32_t *>(b + 0x54);
+	auto &submitted = *reinterpret_cast<uint32_t *>(b + 0x74);
+	if (!ring || !size || size > 0x100000 || tail != submitted || tail + 0x20 > size || !b[0x70]) {
+		vceProbeState = 2;
+		diskLogEvent("vce probe: ring 1 not usable (enabled %u tail %x submitted %x size %x)", b[0x70], tail, submitted,
+			size);
+		return;
+	}
+	*reinterpret_cast<volatile uint32_t *>(target) = 0;
+	uint64_t mc = smuLoad.mc + Smu8::VcePdOffset;
+	// Then Linux's VCE IB test (amdgpu_vce_get_create_msg for firmware >= 52: session, create 128x96, feedback), the
+	// case known to work on Stoney: IB_VM with VMID 0 and memory-controller addresses, from our region (IB at +0x1000,
+	// feedback at +0x2000), then a third fence (+0x100). If it lands, the encoder runs sessions and Apple's job is what
+	// fails; if not, the encoding engine itself doesn't run.
+	auto *region = carvePtr(smuLoad.phys + Smu8::VcePdOffset, 0x4000);
+	if (!region || tail + 0x80 > size || size < 0x1000) {
+		vceProbeState = 2;
+		return;
+	}
+	auto *ibMem = reinterpret_cast<uint32_t *>(region + 0x1000);
+	uint64_t ibMc = mc + 0x1000, fbMc = mc + 0x2000;
+	static const uint32_t create[] {0xc, 1, 1, 0x40, 0x01000001, 0, 0x42, 0xa, 1, 0x80, 0x60, 0x100, 0x100, 0xc, 0, 0, 0,
+		0, 0};
+	memset(region + 0x1000, 0, 0x2000);
+	memcpy(ibMem, create, sizeof(create));
+	uint32_t ibDw = arrsize(create);
+	ibMem[ibDw++] = 0x14;
+	ibMem[ibDw++] = 0x05000005;
+	ibMem[ibDw++] = static_cast<uint32_t>(fbMc >> 32);
+	ibMem[ibDw++] = static_cast<uint32_t>(fbMc);
+	ibMem[ibDw++] = 1;
+	*reinterpret_cast<volatile uint32_t *>(region + 0x100) = 0;
+	uint32_t test[0x20] {0x102, 0, static_cast<uint32_t>(ibMc), static_cast<uint32_t>(ibMc >> 32), ibDw, 3,
+		static_cast<uint32_t>(mc + 0x100), static_cast<uint32_t>((mc + 0x100) >> 32), VceProbeValue + 2, 1};
+	uint32_t *p = ring + tail;
+	// Second fence: system memory through the GART (Apple's fence is at 0x20000280), into ring 1's own last dwords,
+	// which nothing uses while its tail stays near the start.
+	uint64_t ringMc = static_cast<uint64_t>(m[0x8061]) << 32 | m[0x8060];
+	vceRing1Mc = ringMc;
+	vceProbeGart = ringMc + (static_cast<uint64_t>(size) - 4) * 4;
+	ring[size - 4] = 0;
+	uint32_t cmd[0x20] {3, static_cast<uint32_t>(mc), static_cast<uint32_t>(mc >> 32), VceProbeValue, 3,
+		static_cast<uint32_t>(vceProbeGart), static_cast<uint32_t>(vceProbeGart >> 32), VceProbeValue + 1, 1};
+	// Third: VMID 7 or system memory? (2244ebf log 1747210313: the swap under VMID 7 still gave no fence.) The same
+	// create message (session handle 3: the one above has 1, the swap 2, so none is a second create of a live
+	// session) from system memory under VMID 0: IB in ring 1's GART pages halfway in (unused), feedback 0x400 bytes on,
+	// fence 0xCAFE0004 to our region +0x104. Lands: system memory is fine and VMID 7 is the problem; doesn't: VCE
+	// can't read system memory (snooped pages) at all.
+	uint32_t half = size / 2;
+	uint64_t sysIb = ringMc + static_cast<uint64_t>(half) * 4, sysFb = sysIb + 0x400;
+	uint32_t *sysMem = ring + half;
+	memset(sysMem, 0, 0x500);
+	memcpy(sysMem, create, sizeof(create));
+	sysMem[2] = 3;
+	uint32_t sysDw = arrsize(create);
+	sysMem[sysDw++] = 0x14;
+	sysMem[sysDw++] = 0x05000005;
+	sysMem[sysDw++] = static_cast<uint32_t>(sysFb >> 32);
+	sysMem[sysDw++] = static_cast<uint32_t>(sysFb);
+	sysMem[sysDw++] = 1;
+	flushLines(reinterpret_cast<const uint8_t *>(sysMem), 0x500);
+	*reinterpret_cast<volatile uint32_t *>(region + 0x104) = 0;
+	uint32_t sysTest[0x20] {0x102, 0, static_cast<uint32_t>(sysIb), static_cast<uint32_t>(sysIb >> 32), sysDw, 3,
+		static_cast<uint32_t>(mc + 0x104), static_cast<uint32_t>((mc + 0x104) >> 32), VceProbeValue + 3, 1};
+	// Fourth: our own page table in a free VMID (43931af log 1747215214: VMID 7 gives no fence and no VM fault in
+	// either context). Apple's layout (the shared VM_CONTEXT1_CNTL depth/block size and start), one page in our region
+	// serving as both directory and table: PDE 0 points back at the page, PTE 1 is a copy of the GART entry of the
+	// system memory page the VMID 0 test above runs from. So VA start + 0x1000 + x = that page + x. The same create
+	// message (handle 5) at +0x800 in that page, feedback +0xC00, fence 0xCAFE0006 to our region +0x10C. Fences: VCE's
+	// VMIDs work and Apple's VMID 7 tables are what differ (compare the PTE flags logged); no fence: VCE can't use any
+	// VMID but 0 here, and its jobs have to be moved to VMID 0. Firmware's UPDATE_PTB writes that VMID's base register;
+	// the watcher puts it back after.
+	uint32_t ownCmd[0x20] {};
+	uint32_t depth = (m[0x505] >> 1) & 3;
+	uint64_t sysPte = gartPte(sysIb);
+	vceOwnVmid = 0;
+	for (uint32_t v = 15; v >= 8 && !vceOwnVmid; v--)
+		if (!m[0x50E + v - 8])
+			vceOwnVmid = v;
+	if (depth == 1 && (sysPte & 1) && vceOwnVmid) {
+		auto *tbl = reinterpret_cast<uint64_t *>(region + 0x3000);
+		uint64_t tblMc = mc + 0x3000;
+		memset(tbl, 0, 0x1000);
+		tbl[0] = tblMc | 1;
+		tbl[1] = sysPte;
+		uint64_t ownVa = (static_cast<uint64_t>(m[0x558]) << 12) + 0x1000 + 0x800, ownFb = ownVa + 0x400;
+		uint32_t *own = sysMem + 0x200;
+		memset(own, 0, 0x800);
+		memcpy(own, create, sizeof(create));
+		own[2] = 5;
+		uint32_t ownDw = arrsize(create);
+		own[ownDw++] = 0x14;
+		own[ownDw++] = 0x05000005;
+		own[ownDw++] = static_cast<uint32_t>(ownFb >> 32);
+		own[ownDw++] = static_cast<uint32_t>(ownFb);
+		own[ownDw++] = 1;
+		flushLines(reinterpret_cast<const uint8_t *>(own), 0x800);
+		*reinterpret_cast<volatile uint32_t *>(region + 0x10C) = 0;
+		uint32_t v = vceOwnVmid, pd = static_cast<uint32_t>(tblMc >> 12);
+		uint32_t c[] {0x107, v, pd, 0x108, v, 1, 0x102, v, static_cast<uint32_t>(ownVa), static_cast<uint32_t>(ownVa >> 32),
+			ownDw, 3, static_cast<uint32_t>(mc + 0x10C), static_cast<uint32_t>((mc + 0x10C) >> 32), VceProbeValue + 5, 1};
+		memcpy(ownCmd, c, sizeof(c));
+		vceOwnMs = uptimeMs();
+	} else {
+		vceOwnVmid = 0;
+		ownCmd[0] = 1;  // END
+	}
+	memcpy(p, cmd, sizeof(cmd));
+	memcpy(p + 0x20, test, sizeof(test));
+	memcpy(p + 0x40, sysTest, sizeof(sysTest));
+	memcpy(p + 0x60, ownCmd, sizeof(ownCmd));
+	flushLines(reinterpret_cast<const uint8_t *>(p), 0x80 * 4);
+	__asm__ volatile("sfence" ::: "memory");
+	tail += 0x80;
+	if (tail >= size)
+		tail = 0;
+	submitted = tail;
+	m[0xC200] = 7;
+	m[0x8064] = tail;
+	uint32_t rptr = m[0x8063];
+	m[0xC200] = 0xE0000000;
+	vceProbeState = 1;
+	diskLogEvent("vce probe: FENCE %x -> mc %llx, FENCE %x -> gart %llx on ring 1, wptr %x (rptr %x); sysmem IB at gart "
+		"%llx (pte %llx); own table: vmid %u depth %u", VceProbeValue, mc, VceProbeValue + 1, vceProbeGart, tail, rptr,
+		sysIb, sysPte, vceOwnVmid, depth);
+}
+
+// Is it Apple's IB, or VCE's access through VMID 7? (log 1747203593, 70044fc: Linux's create-session IB ran from our
+// VRAM with VMID 0.) With -crvceswapib, overwrite Apple's first IB in place, through its VMID 7 mapping, with that
+// same Linux create message (feedback 0x400 bytes on, in the same page), and fix the block's IB length; Apple's block
+// then goes out as before. A fence means VMID 7 works and Apple's IB contents are the problem. It ends Apple's session.
+static uint32_t vceSwaps;
+
+// Ring: Linux's jobs go on VCE ring 0 (VCE_RB_*, 0x8060), Apple's on RB2 (its "LLQ", 0x805B), and every probe that
+// worked ran on 0x8060. So the swap also writes a second copy (session handle 4) 0x500 bytes after the first, in the
+// same page, and sends it on ring 1 (0x8060) under the same VMID 7 page directory, Linux style (UPDATE_PTB, FLUSH_TLB,
+// END, IB_VM, FENCE 0xCAFE0005 to our region +0x108, END). Copy on ring 1 fences but Apple's ring doesn't: the ring is
+// the problem.
+static bool vceRing1Send(const uint32_t *cmd, uint32_t dwords) {
+	auto *m = gpuMmio;
+	auto *b = static_cast<uint8_t *>(vceRing1);
+	if (!m || !b || dwords > 0x20)
+		return false;
+	auto *ring = *reinterpret_cast<uint32_t **>(b + 0x40);
+	auto &size = *reinterpret_cast<uint32_t *>(b + 0x30);
+	auto &tail = *reinterpret_cast<uint32_t *>(b + 0x54);
+	auto &submitted = *reinterpret_cast<uint32_t *>(b + 0x74);
+	if (!ring || !size || size > 0x100000 || tail != submitted || tail + 0x20 > size || !b[0x70])
+		return false;
+	uint32_t *p = ring + tail;
+	memset(p, 0, 0x80);
+	memcpy(p, cmd, dwords * 4);
+	flushLines(reinterpret_cast<const uint8_t *>(p), 0x80);
+	__asm__ volatile("sfence" ::: "memory");
+	tail += 0x20;
+	if (tail >= size)
+		tail = 0;
+	submitted = tail;
+	m[0xC200] = 7;
+	m[0x8064] = tail;
+	m[0xC200] = 0xE0000000;
+	return true;
+}
+static void vceSwapIb(uint32_t vmid, uint64_t va, uint32_t *ibCmd, uint32_t pd) {
+	if (vceSwaps || !checkKernelArgument("-crvceswapib") || (va & 0xFFF) + 0x500 > 0x1000)
+		return;
+	vceSwaps++;
+	uint64_t phys = ibVaToPhys(vmid, va);
+	bool second = (va & 0xFFF) + 0xA00 <= 0x1000;
+	auto *p = phys ? physmapPtr(phys, second ? 0xA00 : 0x500) : nullptr;
+	if (!p) {
+		diskLogEvent("vce swap: IB va %llx not mapped (phys %llx)", va, phys);
+		return;
+	}
+	uint64_t fbVa = va + 0x400;
+	static const uint32_t create[] {0xc, 1, 1, 0x40, 0x01000001, 0, 0x42, 0xa, 1, 0x80, 0x60, 0x100, 0x100, 0xc, 0, 0, 0,
+		0, 0};
+	auto *ib = reinterpret_cast<uint32_t *>(p);
+	memset(p, 0, 0x500);
+	memcpy(ib, create, sizeof(create));
+	ib[2] = 2;  // session handle 2: the probe's create (1) already made session 1
+	uint32_t dw = arrsize(create);
+	ib[dw++] = 0x14;
+	ib[dw++] = 0x05000005;
+	ib[dw++] = static_cast<uint32_t>(fbVa >> 32);
+	ib[dw++] = static_cast<uint32_t>(fbVa);
+	ib[dw++] = 1;
+	flushLines(p, 0x500);
+	ibCmd[4] = dw;
+	diskLogEvent("vce swap: Apple's IB at va %llx (phys %llx) now Linux's create message, %u dwords", va, phys, dw);
+	auto *region = smuLoad.mc ? carvePtr(smuLoad.phys + Smu8::VcePdOffset, 0x3000) : nullptr;
+	if (!second || !region || !pd) {
+		vceRing1Vm7State = 2;
+		return;
+	}
+	uint64_t va2 = va + 0x500, fb2 = va2 + 0x400, mc = smuLoad.mc + Smu8::VcePdOffset;
+	auto *ib2 = reinterpret_cast<uint32_t *>(p + 0x500);
+	memset(ib2, 0, 0x500);
+	memcpy(ib2, create, sizeof(create));
+	ib2[2] = 4;
+	uint32_t dw2 = arrsize(create);
+	ib2[dw2++] = 0x14;
+	ib2[dw2++] = 0x05000005;
+	ib2[dw2++] = static_cast<uint32_t>(fb2 >> 32);
+	ib2[dw2++] = static_cast<uint32_t>(fb2);
+	ib2[dw2++] = 1;
+	flushLines(p + 0x500, 0x500);
+	*reinterpret_cast<volatile uint32_t *>(region + 0x108) = 0;
+	uint32_t cmd[] {0x107, vmid, pd, 0x108, vmid, 1, 0x102, vmid, static_cast<uint32_t>(va2),
+		static_cast<uint32_t>(va2 >> 32), dw2, 3, static_cast<uint32_t>(mc + 0x108), static_cast<uint32_t>((mc + 0x108) >> 32),
+		VceProbeValue + 4, 1};
+	vceRing1Vm7State = vceRing1Send(cmd, arrsize(cmd)) ? 1 : 2;
+	diskLogEvent("vce swap: second copy at va %llx on ring 1 under vmid %u (pd %x): %s", va2, vmid, pd,
+		vceRing1Vm7State == 1 ? "sent" : "ring 1 not usable");
+}
+
+static void vcePrependPtb(void *that) {
+	static int off = -1;
+	if (off < 0)
+		off = checkKernelArgument("-crnovceptb") ? 1 : 0;
+	auto *m = gpuMmio;
+	if (off || !m)
+		return;
+	auto *b = static_cast<uint8_t *>(that);
+	auto *ring = *reinterpret_cast<uint32_t **>(b + 0x40);
+	uint32_t size = *reinterpret_cast<uint32_t *>(b + 0x30), tail = *reinterpret_cast<uint32_t *>(b + 0x54),
+			 pos = *reinterpret_cast<uint32_t *>(b + 0x74);
+	if (!ring || !size || size > 0x100000 || tail >= size || pos >= size)
+		return;
+	for (uint32_t n = 0; pos != tail && n < 64; n++) {
+		if (pos + 0x20 > size)
+			break;
+		uint32_t *blk = ring + pos;
+		if (blk[0] == 0x102 && blk[5] == 3 && blk[1] && blk[1] < 16 && vceBridgeBlock(blk)) {
+			// moved to VMID 0: no page directory update needed
+		} else if (blk[0] == 0x102 && blk[5] == 3 && blk[1] < 16) {
+			uint32_t used = 0x20;
+			while (used && !blk[used - 1])
+				used--;
+			uint32_t vmid = blk[1];
+			uint32_t pd = vmid < 8 ? m[0x54F + vmid] : m[0x50E + vmid - 8];
+			if (pd)
+				pd = vceShadowPd(pd);
+			if (used + 6 <= 0x20 && pd) {
+				uint32_t copy[0x20];
+				memcpy(copy, blk, used * 4);
+				uint32_t head[6] {0x107, vmid, pd, 0x108, vmid, 1};
+				memcpy(blk, head, sizeof(head));
+				memcpy(blk + 6, copy, used * 4);
+				for (uint32_t i = used + 6; i < 0x20; i++)
+					blk[i] = 0;
+				vceSwapIb(vmid, static_cast<uint64_t>(blk[6 + 3]) << 32 | blk[6 + 2], blk + 6, pd);
+				if (vcePtbRewrites++ < 8)
+					diskLogEvent("vce ptb: block at %x: vmid %u page directory %x (%u dwords before, VM_CONTEXT cntl %x)",
+						pos, vmid, pd, used, m[0x504 + (vmid ? 1 : 0)]);
+			} else if (vcePtbSkips++ < 8) {
+				diskLogEvent("vce ptb: block at %x skipped: vmid %u pd %x used %u", pos, vmid, pd, used);
+			}
+		}
+		pos += 0x20;
+		if (pos >= size)
+			pos = 0;
+	}
+}
+
+// The swap (log 1747208987): Linux's create message, which runs from our VRAM under VMID 0, written into Apple's IB and
+// run under VMID 7 from system memory, gave no fence either. So it is VCE's VMID 7 / system memory path, not Apple's IB.
+// Apple's start leaves VCE_LMI_CTRL (0x85A6) at 0x200000 (VCPU_DATA_COHERENCY_EN only); Linux's vce_v3_0_mc_resume
+// writes 0x00398000 on every VCE 3 part (bits 15, 16, 19, 20 unnamed). Before each LLQ submit, under the instance
+// select, add the missing bits; the first change is logged. -crnovcelmi leaves it.
+static constexpr uint32_t VceLmiCtrl = 0x85A6, VceLmiCtrlLinux = 0x00398000;
+static uint32_t vceLmiFixes;
+
+static void vceLmiFix() {
+	auto *m = gpuMmio;
+	if (!m || checkKernelArgument("-crnovcelmi"))
+		return;
+	m[0xC200] = 7;
+	uint32_t before = m[VceLmiCtrl], after = before;
+	if ((before & VceLmiCtrlLinux) != VceLmiCtrlLinux) {
+		m[VceLmiCtrl] = before | VceLmiCtrlLinux;
+		after = m[VceLmiCtrl];
+	}
+	uint32_t ctrl2 = m[0x859D], cache = m[0x85BD], vm = m[0x85A8];
+	m[0xC200] = 0xE0000000;
+	if (before != after && !vceLmiFixes++)
+		diskLogEvent("vce lmi: VCE_LMI_CTRL %x -> %x (Linux %x); CTRL2 %x CACHE_CTRL %x VM_CTRL %x", before, after,
+			VceLmiCtrlLinux, ctrl2, cache, vm);
+}
+
+static void wrapRingSubmit(void *that) {
+	if (uvdDecRingVtable && that && *reinterpret_cast<mach_vm_address_t *>(that) == uvdDecRingVtable) {
+		uvdBridgeRing(that);
+		FunctionCast(wrapRingSubmit, orgRingSubmit)(that);
+		return;
+	}
+	auto kind = vceRingKind(that);
+	if (kind == 2) {
+		vceLmiFix();
+		vceFenceProbe();
+	}
+	if (kind) {
+		vcePrependPtb(that);
+		vceRingLog("submit (before)", that, kind, 0);
+	}
+	FunctionCast(wrapRingSubmit, orgRingSubmit)(that);
+}
+
+static void wrapRingFlush(void *that) {
+	auto kind = vceRingKind(that);
+	if (kind)
+		vceRingLog("flushWithoutSubmit (before)", that, kind, 0);
+	FunctionCast(wrapRingFlush, orgRingFlush)(that);
+}
+
+static bool wrapVceRegLoc(void *that) {
+	bool ret = FunctionCast(wrapVceRegLoc, orgVceRegLoc)(that);
+	vceRingLog("registerLocation", that, 1, ret);
+	vceSnapshot("ring1 registered");
+	return ret;
+}
+
+static bool wrapVceLlqRegLoc(void *that) {
+	bool ret = FunctionCast(wrapVceLlqRegLoc, orgVceLlqRegLoc)(that);
+	vceRingLog("registerLocation", that, 2, ret);
+	vceSnapshot("llq registered");
+	return ret;
+}
+
+static uint32_t wrapVceGetHead(void *that) {
+	auto ret = FunctionCast(wrapVceGetHead, orgVceGetHead)(that);
+	vceLive.heads++;
+	vceSnapshot("head");
 	return ret;
 }
 
@@ -6552,11 +7421,19 @@ static const char *sclkDpmState() {
 	return smuDpm.resp[0] == 1 ? "on" : "failed";
 }
 
+// After a wake the video power-up was never redone (log 1747206161: idle sleep, then every VCE context refused as
+// unpowered). AMDHardware::powerUpHWEngines runs smuVideoPowerOn on entry, while smuVideo.done is still set from boot,
+// and only then does its PM4 power-up reach this load, find the SMU's power lost and clear smuVideo.done. So power
+// video up here, after a reload that followed a power loss: still before Apple powers UVD and VCE (later slots in the
+// same powerUpHWEngines loop), as at boot.
 static uint64_t wrapStoneyLoadRlcUcode(void *cail) {
+	uint32_t lossesBefore = smuPowerLosses;
 	smuLoadFirmware(cail);
 	auto ret = FunctionCast(wrapStoneyLoadRlcUcode, orgStoneyLoadRlcUcode)(cail);
 	if (smuLoad.result)
 		smuStep(7);  // CAIL has started the RLC, now with real microcode
+	if (smuPowerLosses != lossesBefore && smuLoadOk() && checkKernelArgument("-crvideo"))
+		smuVideoPowerOn();
 	return ret;
 }
 
@@ -6999,10 +7876,10 @@ void CRDriver::traceFramebuffer(KernelPatcher &patcher, size_t index, mach_vm_ad
 IODeviceMemory *CRDriver::wrapGetApertureRange(void *that, int aperture) {
 	auto *mem = FunctionCast(wrapGetApertureRange, callback->orgGetApertureRange)(that, aperture);
 	if (mem)
-		IOLog("CarrizoRed: fb.getApertureRange(%d) -> phys 0x%llx length 0x%llx\n", aperture,
+		IOLog("UnifiedRed: fb.getApertureRange(%d) -> phys 0x%llx length 0x%llx\n", aperture,
 			static_cast<uint64_t>(mem->getPhysicalAddress()), static_cast<uint64_t>(mem->getLength()));
 	else
-		IOLog("CarrizoRed: fb.getApertureRange(%d) -> none\n", aperture);
+		IOLog("UnifiedRed: fb.getApertureRange(%d) -> none\n", aperture);
 	traceEvent("fb.getApertureRange", true, mem ? static_cast<uint32_t>(mem->getPhysicalAddress() >> 20) : 0);
 	IOSleep(30);
 	return mem;
@@ -7044,35 +7921,35 @@ void CRDriver::traceSupport(KernelPatcher &patcher, size_t index, mach_vm_addres
 // -crreglogall: register logging starts here (every access, with values), instead of 2 s after start.
 IOService *CRDriver::wrapAtiProbe(IOService *that, IOService *provider, SInt32 *score) {
 	if (checkKernelArgument("-crnoctl")) {
-		IOLog("CarrizoRed: %s::probe -> NO MATCH (-crnoctl)\n", that->getMetaClass()->getClassName());
+		IOLog("UnifiedRed: %s::probe -> NO MATCH (-crnoctl)\n", that->getMetaClass()->getClassName());
 		traceNote("%s.probe=blocked ", that->getMetaClass()->getClassName());
 		return nullptr;
 	}
 	if (regLogAll && !regLogFromMs) {
 		regLogFromMs = uptimeMs();
-		IOLog("CarrizoRed: logging every register access from probe (-crreglogall)\n");
+		IOLog("UnifiedRed: logging every register access from probe (-crreglogall)\n");
 	}
-	IOLog("CarrizoRed: %s::probe ...\n", that->getMetaClass()->getClassName());
+	IOLog("UnifiedRed: %s::probe ...\n", that->getMetaClass()->getClassName());
 	auto *ret = FunctionCast(wrapAtiProbe, callback->orgAtiProbe)(that, provider, score);
-	IOLog("CarrizoRed: %s::probe -> %s\n", that->getMetaClass()->getClassName(), ret ? "match" : "NO MATCH");
+	IOLog("UnifiedRed: %s::probe -> %s\n", that->getMetaClass()->getClassName(), ret ? "match" : "NO MATCH");
 	traceNote("%s.probe=%s ", that->getMetaClass()->getClassName(), ret ? "match" : "NO");
 	// ATIController::start can't be wrapped safely (see routeChecked), so the first-touch register log opens a fixed
 	// time after a successful probe instead of 2 s after start returns (start takes about 1 s).
 	if (ret && !regLogFromMs) {
 		regLogFromMs = uptimeMs() + 5000;
-		IOLog("CarrizoRed: logging registers first touched from probe + 5 s\n");
+		IOLog("UnifiedRed: logging registers first touched from probe + 5 s\n");
 	}
 	return ret;
 }
 
 bool CRDriver::wrapAtiStart(IOService *that, IOService *provider) {
-	IOLog("CarrizoRed: %s::start ...\n", that->getMetaClass()->getClassName());
+	IOLog("UnifiedRed: %s::start ...\n", that->getMetaClass()->getClassName());
 	bool ret = FunctionCast(wrapAtiStart, callback->orgAtiStart)(that, provider);
-	IOLog("CarrizoRed: %s::start -> %s\n", that->getMetaClass()->getClassName(), ret ? "OK" : "FAILED");
+	IOLog("UnifiedRed: %s::start -> %s\n", that->getMetaClass()->getClassName(), ret ? "OK" : "FAILED");
 	traceNote("%s.start=%s ", that->getMetaClass()->getClassName(), ret ? "OK" : "FAILED");
 	if (ret && !regLogFromMs) {
 		regLogFromMs = uptimeMs() + 2000;
-		IOLog("CarrizoRed: logging registers first touched from now + 2 s\n");
+		IOLog("UnifiedRed: logging registers first touched from now + 2 s\n");
 	}
 	return ret;
 }
@@ -7240,7 +8117,7 @@ static void printRegEvent(const RegEvent &event, const char *suffix) {
 	char pipe[48] = "";
 	if (event.pipe >= 0)
 		snprintf(pipe, sizeof(pipe), " [PIPE %d, APU has %u%s]", event.pipe, pipeLimit, pipeGuard ? ", blocked" : "");
-	IOLog("CarrizoRed: new reg %s 0x%x/0x%x%s%s%s\n", regOpNames[event.op], event.offset, event.extra, value, pipe,
+	IOLog("UnifiedRed: new reg %s 0x%x/0x%x%s%s%s\n", regOpNames[event.op], event.offset, event.extra, value, pipe,
 		suffix);
 }
 
@@ -7284,7 +8161,7 @@ static int regAccess(RegOp op, uint32_t offset, uint32_t extra, uint32_t value) 
 // Value of a read whose access line was printed (-crreglogall only).
 static uint32_t regReadDone(int flags, uint32_t value) {
 	if ((flags & RegPrinted) && regLogAll)
-		IOLog("CarrizoRed:     = 0x%x\n", value);
+		IOLog("UnifiedRed:     = 0x%x\n", value);
 	return value;
 }
 
@@ -7541,7 +8418,7 @@ void CRDriver::wrapIhHandler(void *that, void *owner, void *arg, void *nub, int 
 	int32_t before = preemptionLevelOff >= 0 ? preemptionLevel() : 0;
 	FunctionCast(wrapIhHandler, callback->orgIhHandler)(that, owner, arg, nub, source);
 	if (int32_t after = preemptionLevelOff >= 0 ? preemptionLevel() : 0; after != before)
-		panic("CarrizoRed: preemption level %d -> %d across BaffinInterruptManager::handler (IH rptr %x wptr %x)", before,
+		panic("UnifiedRed: preemption level %d -> %d across BaffinInterruptManager::handler (IH rptr %x wptr %x)", before,
 			after, gpuMmio ? gpuMmio[IhReg::RB_RPTR] : 0, gpuMmio ? gpuMmio[IhReg::RB_WPTR] : 0);
 }
 
@@ -7582,7 +8459,7 @@ static void pmLog(bool canSleep, const char *tag, uint32_t value, const char *fm
 	va_start(va, fmt);
 	vsnprintf(line, sizeof(line), fmt, va);
 	va_end(va);
-	IOLog("CarrizoRed: %s\n", line);
+	IOLog("UnifiedRed: %s\n", line);
 	if (canSleep)
 		IOSleep(30);
 	else
@@ -7812,19 +8689,19 @@ static void printMsiState(IOPCIDevice *device, const char *when) {
 			} else {
 				data = device->configRead16(cap + 8);
 			}
-			IOLog("CarrizoRed: %s: PCI command 0x%04x, MSI cap 0x%x control 0x%04x (%s) address 0x%08x%08x data 0x%04x\n",
+			IOLog("UnifiedRed: %s: PCI command 0x%04x, MSI cap 0x%x control 0x%04x (%s) address 0x%08x%08x data 0x%04x\n",
 				when, command, cap, control, (control & 1) ? "ENABLED" : "off", addressHi, addressLo, data);
 			return;
 		}
 		cap = device->configRead8(cap + 1) & 0xFC;
 	}
-	IOLog("CarrizoRed: %s: PCI command 0x%04x, no MSI capability\n", when, command);
+	IOLog("UnifiedRed: %s: PCI command 0x%04x, no MSI capability\n", when, command);
 }
 
 IOReturn CRDriver::wrapInstallInterrupts(void *that) {
 	auto *gpu = callback->iGPU;
 	if (checkKernelArgument("-crnoints")) {
-		IOLog("CarrizoRed: installInterruptsOnPciDevice skipped (-crnoints): no interrupt registered or enabled\n");
+		IOLog("UnifiedRed: installInterruptsOnPciDevice skipped (-crnoints): no interrupt registered or enabled\n");
 		traceNote("ints=skipped ");
 		if (gpu)
 			printMsiState(gpu, "-crnoints");
@@ -7836,7 +8713,7 @@ IOReturn CRDriver::wrapInstallInterrupts(void *that) {
 	auto ret = FunctionCast(wrapInstallInterrupts, callback->orgInstallInterrupts)(that);
 	// AtiFbInterruptManager: +0x31 installed, +0x34 interrupt index (see installInterruptsOnPciDevice).
 	auto *manager = static_cast<uint8_t *>(that);
-	IOLog("CarrizoRed: installInterruptsOnPciDevice = 0x%x, index %u%s\n", ret, *reinterpret_cast<uint32_t *>(manager + 0x34),
+	IOLog("UnifiedRed: installInterruptsOnPciDevice = 0x%x, index %u%s\n", ret, *reinterpret_cast<uint32_t *>(manager + 0x34),
 		manager[0x31] ? "" : " (not installed)");
 	traceNote("ints=%x/%u ", ret, *reinterpret_cast<uint32_t *>(manager + 0x34));
 	if (gpu)
@@ -7954,7 +8831,7 @@ uint8_t CRDriver::wrapExecuteBiosCommandTable(void *that, uint32_t table, void *
 	}
 	// TMDS (DVI 2, HDMI 3) PHY clock source. The PHY takes its clock from the PLL in asConfig ucPhyClkSrcId (bits 3:2,
 	// ENCODER_REFCLK_SRC_P1PLL 0 / P2PLL 1 / DCPLL 2), which Linux sets to the same ATOM PLL id as SetPixelClock's
-	// ucPpll. Apple passes its own PLL index there, and CarrizoRed remaps index 1 to ATOM_PPLL0 (2) for SetPixelClock
+	// ucPpll. Apple passes its own PLL index there, and UnifiedRed remaps index 1 to ATOM_PPLL0 (2) for SetPixelClock
 	// and the CRTC's pixel rate source (see atomPllFor) but not here: the D509BA's HDMI mode set programmed 148.5 MHz in
 	// PPLL0 while the PHY was told P2PLL, which DCE 11.0 doesn't use, and the monitor got no signal (log 1746945787:
 	// SetPixelClock ucPpll 2, transmitter config 0x26). Apply the same remap. -crnopllremap leaves both alone.
@@ -8087,7 +8964,7 @@ uint8_t CRDriver::wrapExecuteBiosCommandTable(void *that, uint32_t table, void *
 			AtomTransmitterTable, power, flag);
 		AtomCall injected {};
 		injected.table = static_cast<uint16_t>(AtomTransmitterTable);
-		injected.ok = static_cast<uint8_t>((powered & 1) | 0x40);  // 0x40 = injected by CarrizoRed
+		injected.ok = static_cast<uint8_t>((powered & 1) | 0x40);  // 0x40 = injected by UnifiedRed
 		injected.repeat = 1;
 		memcpy(injected.in, power, sizeof(injected.in));
 		memcpy(injected.out, power, sizeof(injected.out));
@@ -8450,7 +9327,7 @@ static void assrProbe(void *that, uint8_t flags, IOReturn (*read)(void *, uint32
 		assrCap = value;
 	if (read(that, 0x10A, 1, &value, flags) == kIOReturnSuccess)
 		assrBoot = value;
-	IOLog("CarrizoRed: eDP DPCD 0x00D (eDP config cap) = 0x%02x, 0x10A (eDP config set) = 0x%02x before Apple's link "
+	IOLog("UnifiedRed: eDP DPCD 0x00D (eDP config cap) = 0x%02x, 0x10A (eDP config set) = 0x%02x before Apple's link "
 		  "setup\n", assrCap, assrBoot);
 }
 
@@ -8710,7 +9587,7 @@ static void restoreTick(uint32_t t) {
 	while (restoreDone < sizeof(restoreSteps) / sizeof(restoreSteps[0]) && t >= restoreSteps[restoreDone].at) {
 		uint32_t written = restoreStep(restoreDone++);
 		restoreWrites += written;
-		IOLog("CarrizoRed: t=%us restore step %u (%s): %u registers set to their boot values\n", t, restoreDone,
+		IOLog("UnifiedRed: t=%us restore step %u (%s): %u registers set to their boot values\n", t, restoreDone,
 			restoreSteps[restoreDone - 1].name, written);
 	}
 }
@@ -8826,8 +9703,8 @@ void CRDriver::logPCIInfo() {
 		SYSLOG("cr", "BAR5 (MMIO) 0x%llX size 0x%llX", static_cast<uint64_t>(bar5->getPhysicalAddress()),
 			static_cast<uint64_t>(bar5->getLength()));
 
-	iGPU->setProperty("CarrizoRed,family", familyName(family));
-	iGPU->setProperty("CarrizoRed,revision", revision, 8);
+	iGPU->setProperty("UnifiedRed,family", familyName(family));
+	iGPU->setProperty("UnifiedRed,revision", revision, 8);
 
 	// PowerPlay (HWLibs PHM_Initialize) has back ends for VI dGPUs, Vega, Navi and Raven/Renoir, but none for family
 	// 0x87 (Carrizo/Stoney), and the APU spoofed as Polaris 11 gets the VI path: the Tonga table parser and the Polaris
@@ -8842,7 +9719,7 @@ void CRDriver::logPCIInfo() {
 	}
 }
 
-// The GPU's registers (BAR5). IOKit's mapDeviceMemoryWithRegister can fail when CarrizoRed starts before the PCI
+// The GPU's registers (BAR5). IOKit's mapDeviceMemoryWithRegister can fail when UnifiedRed starts before the PCI
 // family has registered the device's memory ranges (nvram4-6: black screens, gpuMmio never set, so no SMU microcode
 // load, no FB move, nothing): then map BAR5 straight from config space (256 KB, uncached). Retried on demand
 // (ensureMmio) from the watcher, the SMU loader and the RLC halt hook.
@@ -8897,7 +9774,7 @@ void CRDriver::probeMMIO() {
 		gpuDeadAtStart = true;
 		checkGpuAlive(mmio);
 		SYSLOG("cr", "the GPU isn't responding at start-up (registers read 0xFFFFFFFF): power the machine off fully");
-		iGPU->setProperty("CarrizoRed,gpu-dead", true);
+		iGPU->setProperty("UnifiedRed,gpu-dead", true);
 	}
 	auto gbAddrConfig = mmio[Reg::GB_ADDR_CONFIG];
 	auto shaderArrayConfig = mmio[Reg::CC_GC_SHADER_ARRAY_CONFIG];
@@ -8916,9 +9793,9 @@ void CRDriver::probeMMIO() {
 	SYSLOG("cr", "GRBM_STATUS 0x%08X GB_ADDR_CONFIG 0x%08X CC_GC_SHADER_ARRAY_CONFIG 0x%08X CC_RB_BACKEND_DISABLE 0x%08X",
 		grbmStatus, gbAddrConfig, shaderArrayConfig, rbBackendDisable);
 
-	iGPU->setProperty("CarrizoRed,vram-mb", memSize, 32);
-	iGPU->setProperty("CarrizoRed,carveout-phys", carveoutPhys, 64);
-	iGPU->setProperty("CarrizoRed,gb-addr-config", gbAddrConfig, 32);
+	iGPU->setProperty("UnifiedRed,vram-mb", memSize, 32);
+	iGPU->setProperty("UnifiedRed,carveout-phys", carveoutPhys, 64);
+	iGPU->setProperty("UnifiedRed,gb-addr-config", gbAddrConfig, 32);
 
 	initDisplayRegs();
 	relocateFb();
@@ -8975,7 +9852,7 @@ void CRDriver::relocateFb() {
 	fbRelocReadback = mmio[Reg::MC_VM_FB_LOCATION];
 	SYSLOG("cr", "FB window moved from 0x%llX to 0: MC_VM_FB_LOCATION 0x%08X -> 0x%08X (reads 0x%08X), HDP base 0x%X",
 		base, location, moved, fbRelocReadback, hdp);
-	iGPU->setProperty("CarrizoRed,fb-relocated", fbRelocReadback == moved);
+	iGPU->setProperty("UnifiedRed,fb-relocated", fbRelocReadback == moved);
 }
 
 // Display and memory-controller registers watched from boot (firmware/GOP values) through Apple's bring-up: FB
@@ -9397,6 +10274,975 @@ static uint64_t ibVaToPhysWalk(uint32_t vmid, uint64_t va, VmCacheEntry *slot, u
 
 static uint64_t ibVaToPhys(uint32_t vmid, uint64_t va) {
 	return ibVaToPhysWalk(vmid, va, nullptr);
+}
+
+// VCE VMID 0 bridge. VCE here doesn't finish a job under any VMID but 0 (logs 1747212945-1747216893: Linux's create
+// message fences from VRAM and from system memory through the GART under VMID 0, but neither under Apple's VMID 7
+// tables nor under our own one-page table in VMID 15, on either ring, and nothing latches a VM fault). Linux ran VCE
+// without VM before Stoney (vce_v3_0_ring_phys_funcs): amdgpu_vce_ring_parse_cs rewrites each buffer address in the
+// IB to a GPU address the engine reaches directly (amdgpu_vce_cs_reloc). Do the same with Apple's jobs: a window of
+// GART entries (the unused run at the end of the GART table) takes copies of Apple's VMID 7 PTEs for the IB and each
+// buffer the IB names, the addresses in the IB are rewritten to the window, and the ring block's IB_VM goes to VMID 0
+// with the IB's window address. Mappings are kept and reused while Apple's PTEs for them stay the same.
+// -crnovcebridge keeps Apple's VMID 7 path.
+static uint64_t vmPteRaw(uint32_t vmid, uint64_t va) {
+	auto *mmio = gpuMmio;
+	if (!mmio || !vmid || vmid > 15)
+		return 0;
+	uint32_t cntl = mmio[0x505], start = mmio[0x558], end = mmio[0x560];
+	uint64_t page = va >> 12;
+	if (page < start || page > end)
+		return 0;
+	uint32_t depth = (cntl >> 1) & 3, block = (cntl >> 24) & 0xF;
+	uint64_t pdb = static_cast<uint64_t>(vmid < 8 ? mmio[0x54F + vmid] : mmio[0x50E + vmid - 8]) << 12;
+	uint64_t pfn = page - start, entry = 0;
+	if (depth == 0) {
+		if (!ibReadPhys(ibMcToPhys(pdb, false) + pfn * 8, 8, &entry))
+			return 0;
+	} else {
+		uint32_t bits = 9 + block;
+		uint64_t pde = 0;
+		if (!ibReadPhys(ibMcToPhys(pdb, false) + (pfn >> bits) * 8, 8, &pde) || !(pde & 1))
+			return 0;
+		if (!ibReadPhys(ibMcToPhys(pde & 0xFFFFFFFFF000ULL, pde & 2) + (pfn & ((1ULL << bits) - 1)) * 8, 8, &entry))
+			return 0;
+	}
+	return (entry & 1) ? entry : 0;
+}
+
+static struct {
+	bool tried, ok, dirty;
+	uint64_t windowVa;  // GART address of slot 0
+	uint64_t *pte;      // slot 0's GART entry (carve-out, uncached)
+	uint32_t slots, next, entries, tailRun;
+	uint64_t tailValue;
+	uint32_t blocks, maps, pages, reuses, mapFails, relocs, unknownCmds, lastUnknown, badLen, wraps;
+	uint32_t uvdDpbSlot;  // first of the fixed slots for UVD's own DPB (0: none)
+} vceBridge;
+static constexpr uint32_t VceBridgeUvdDpbSlots = 0x1000;  // 16 MB
+
+// ended: the mapping stopped at an unmapped page short of what was asked (so it covers any request from its start);
+// job: the bridged job that last used it (slots of the last VceBridgeKeepJobs jobs aren't taken by a wrap).
+static struct {
+	uint32_t vmid, slot, pages, job;
+	bool ended;
+	uint64_t va, pte0, pteN, pteM;
+} vceBridgeMaps[128];
+
+// Engine (re)start: forget cached mappings (711c96a log 1794540960: the second UVD session hung; a cache entry is only
+// checked at its first, middle and last page, and a new session reuses Apple's VAs with other pages).
+static void vceBridgeForget() {
+	for (auto &e : vceBridgeMaps)
+		e.pages = 0;
+}
+static uint32_t vceBridgeMapNext, vceBridgeJob;
+static constexpr uint32_t VceBridgeKeepJobs = 16;
+
+// Apple's GART manager (AMDRadeonX4000_AMDHWGart, Monterey): init keeps the GART base address at +0x20, its size in
+// pages at +0x38, and an IORangeAllocator over those pages (withRange(pages, 0x20)) at +0x98; AMDHWGart::allocate and
+// ::reserve are that allocator's allocate / allocateRange in pages from the base. The bridge books its window there,
+// so Apple never hands those entries out.
+static void *vceGart;
+
+static bool wrapGartInit(void *that, void *hw, void *params) {
+	bool ret = FunctionCast(wrapGartInit, orgGartInit)(that, hw, params);
+	if (ret && !vceGart)
+		vceGart = that;
+	return ret;
+}
+
+// Book [first, first + slots) (entry indexes from the GART start) in Apple's allocator; if it's taken, let the
+// allocator choose and change first. False: no allocator (the window stays unbooked) or no room.
+static bool vceBridgeBook(uint64_t gartStart, uint32_t entries, uint32_t &first, uint32_t slots, const char *&how) {
+	how = "unbooked (no GART object)";
+	if (!vceGart)
+		return true;
+	auto *base = static_cast<uint8_t *>(vceGart);
+	auto *ra = OSDynamicCast(IORangeAllocator, *reinterpret_cast<OSObject **>(base + 0x98));
+	uint64_t appleBase = *reinterpret_cast<uint64_t *>(base + 0x20);
+	uint32_t applePages = *reinterpret_cast<uint32_t *>(base + 0x38);
+	if (!ra || appleBase != gartStart || applePages != entries) {
+		how = "unbooked (GART object doesn't match)";
+		diskLogEvent("vce bridge: Apple's GART object: allocator %p base %llx pages %x (registers: %llx, %x)", ra, appleBase,
+			applePages, gartStart, entries);
+		return true;
+	}
+	if (ra->allocateRange(first, slots)) {
+		how = "booked in Apple's GART allocator";
+		return true;
+	}
+	IORangeScalar got = 0;
+	if (ra->allocate(slots, &got, 1)) {
+		first = static_cast<uint32_t>(got);
+		how = "booked in Apple's GART allocator (its choice)";
+		return true;
+	}
+	how = "no room in Apple's GART allocator";
+	return false;
+}
+
+static bool vceBridgeInit() {
+	auto &b = vceBridge;
+	if (b.tried)
+		return b.ok;
+	b.tried = true;
+	auto *m = gpuMmio;
+	uint64_t table = static_cast<uint64_t>(m[0x54F]) << 12, start = static_cast<uint64_t>(m[0x557]),
+			 end = static_cast<uint64_t>(m[0x55F]);
+	if (!table || !start || end <= start || end - start > 0x100000) {
+		diskLogEvent("vce bridge: GART not usable (table %llx start %llx end %llx)", table, start, end);
+		return false;
+	}
+	b.entries = static_cast<uint32_t>(end - start + 1);
+	auto *ptes = reinterpret_cast<volatile uint64_t *>(carvePtr(ibMcToPhys(table, false), b.entries * 8));
+	if (!ptes) {
+		diskLogEvent("vce bridge: GART table %llx (%u entries) not mapped", table, b.entries);
+		return false;
+	}
+	// The run at the end equal to the last entry: unused entries are either invalid or all point at one dummy page.
+	b.tailValue = ptes[b.entries - 1];
+	uint32_t run = 0;
+	while (run < b.entries && run < 0x10000 && ptes[b.entries - 1 - run] == b.tailValue)
+		run++;
+	b.tailRun = run;
+	constexpr uint32_t Margin = 64, MaxSlots = 0xF000, MinSlots = 0x800;
+	uint32_t slots = run > Margin ? run - Margin : 0;
+	if (slots > MaxSlots)
+		slots = MaxSlots;
+	uint32_t first = b.entries - Margin - slots;
+	diskLogEvent("vce bridge: GART %llx-%llx (%u entries, table %llx), tail run %u of %llx; entries before it: %llx %llx",
+		start << 12, (end << 12) | 0xFFF, b.entries, table, run, b.tailValue,
+		run < b.entries ? static_cast<uint64_t>(ptes[b.entries - 1 - run]) : 0,
+		run + 1 < b.entries ? static_cast<uint64_t>(ptes[b.entries - 2 - run]) : 0);
+	if (slots < MinSlots || ((b.tailValue & 1) && run < 0x1000)) {
+		diskLogEvent("vce bridge: off, only %u free GART entries", slots);
+		return false;
+	}
+	const char *how = "";
+	if (!vceBridgeBook(start << 12, b.entries, first, slots, how) || first + slots > b.entries) {
+		diskLogEvent("vce bridge: off, %s (%u entries)", how, slots);
+		return false;
+	}
+	b.slots = slots;
+	b.windowVa = (start + first) << 12;
+	b.pte = const_cast<uint64_t *>(ptes) + first;
+	// The top 16 MB of the window: fixed, for UVD's own DPB (uvdOwnDpbMap), outside the round robin.
+	if (checkKernelArgument("-cruvd") && b.slots > 0x3000) {
+		b.slots -= VceBridgeUvdDpbSlots;
+		b.uvdDpbSlot = b.slots;
+	}
+	b.ok = true;
+	diskLogEvent("vce bridge: window %u entries at GART %llx, %s", slots, b.windowVa, how);
+	return true;
+}
+
+// The window address for va, with [va, va + bytes) mapped as far as Apple's VMID tables have it (to the first
+// unmapped page); 0 if va itself isn't mapped.
+static uint64_t vceBridgeMap(uint32_t vmid, uint64_t va, uint64_t bytes) {
+	auto &b = vceBridge;
+	uint64_t pageVa = va & ~0xFFFULL;
+	uint32_t pages = static_cast<uint32_t>((((va & 0xFFF) + bytes + 0xFFF) >> 12));
+	if (!pages)
+		pages = 1;
+	if (pages > b.slots)
+		pages = b.slots;
+	for (auto &e : vceBridgeMaps) {
+		if (!e.pages || e.vmid != vmid || pageVa < e.va || pageVa >= e.va + (static_cast<uint64_t>(e.pages) << 12))
+			continue;
+		uint64_t off = (pageVa - e.va) >> 12;
+		// 769f7ef log 1747556201: a mapping cut short at an unmapped page never "fitted" the size asked again (context
+		// 8 MB asked, 1326 pages there), so every job remapped every buffer and the window wrapped 4 times in 0.5 s,
+		// over entries queued jobs still used, until job 89 hung.
+		// A cut-short mapping covers more than it has only for its own buffer (a request from its first page): one that
+		// starts inside it is another buffer the walk ran into, maybe cut by a gap (2327558 log 1794541933: UVD wrote
+		// only the first rows of its decode target and DPB).
+		bool fits = off + pages <= e.pages || (e.ended && !off);
+		if (fits && vmPteRaw(vmid, e.va) == e.pte0 &&
+			vmPteRaw(vmid, e.va + ((static_cast<uint64_t>(e.pages) - 1) << 12)) == e.pteN &&
+			vmPteRaw(vmid, e.va + ((static_cast<uint64_t>(e.pages) / 2) << 12)) == e.pteM) {
+			b.reuses++;
+			e.job = vceBridgeJob;
+			return b.windowVa + (static_cast<uint64_t>(e.slot) << 12) + (va - e.va);
+		}
+		e.pages = 0;  // changed or too short: map afresh
+	}
+	// Free slots: from the cursor on, wrapping, but not over a mapping one of the last jobs used.
+	uint32_t slot = b.next;
+	bool found = false;
+	for (uint32_t tries = 0; tries < 2 * arrsize(vceBridgeMaps) + 2 && !found; tries++) {
+		if (slot + pages > b.slots) {
+			slot = 0;
+			if (b.wraps++ < 4)
+				diskLogEvent("vce bridge: window wrapped (%u maps, %u pages so far)", b.maps, b.pages);
+		}
+		found = true;
+		for (auto &e : vceBridgeMaps)
+			if (e.pages && vceBridgeJob - e.job < VceBridgeKeepJobs && e.slot < slot + pages && slot < e.slot + e.pages) {
+				slot = e.slot + e.pages;
+				found = false;
+				break;
+			}
+	}
+	if (!found) {
+		b.mapFails++;
+		static uint32_t fullLogs;
+		if (fullLogs++ < 4)
+			diskLogEvent("vce bridge: window full for %u pages (job %u)", pages, vceBridgeJob);
+		return 0;
+	}
+	uint32_t done = 0;
+	uint64_t first = 0, last = 0;
+	for (; done < pages; done++) {
+		uint64_t e = vmPteRaw(vmid, pageVa + (static_cast<uint64_t>(done) << 12));
+		if (!e)
+			break;
+		if (!done)
+			first = e;
+		last = e;
+		b.pte[slot + done] = e & ~0xF80ULL;  // fragment bits off: the window isn't aligned like Apple's VA
+	}
+	if (!done) {
+		b.mapFails++;
+		return 0;
+	}
+	// 2327558 log 1794541933: UVD wrote the first rows of the decode target and DPB, nothing further: log the mappings
+	// (asked, mapped, and the entry where the walk stopped).
+	static uint32_t mapLogs;
+	if (mapLogs++ < 48)
+		diskLogEvent("bridge map: vmid %u va %llx asked %u pages, mapped %u at slot %x%s (stop entry %llx)", vmid, pageVa,
+			pages, done, slot, done < pages ? " (cut short)" : "",
+			done < pages ? vmPteRaw(vmid, pageVa + (static_cast<uint64_t>(done) << 12)) : 0);
+	// Mappings whose slots this one took are gone.
+	for (auto &e : vceBridgeMaps)
+		if (e.pages && e.slot < slot + done && slot < e.slot + e.pages)
+			e.pages = 0;
+	auto &n = vceBridgeMaps[vceBridgeMapNext++ % arrsize(vceBridgeMaps)];
+	n = {vmid, slot, done, vceBridgeJob, done < pages, pageVa, first, last,
+		vmPteRaw(vmid, pageVa + (static_cast<uint64_t>(done / 2) << 12))};
+	b.next = slot + done;
+	b.maps++;
+	b.pages += done;
+	b.dirty = true;
+	return b.windowVa + (static_cast<uint64_t>(slot) << 12) + (va & 0xFFF);
+}
+
+// One dword of the IB, through Apple's tables (the last page is remembered).
+static volatile uint32_t *vceIbDword(uint32_t vmid, uint64_t va) {
+	static uint64_t lastPage = ~0ULL;
+	static uint32_t lastVmid;
+	static uint8_t *lastPtr;
+	uint64_t page = va & ~0xFFFULL;
+	if (page != lastPage || vmid != lastVmid) {
+		uint64_t phys = ibVaToPhys(vmid, page);
+		lastPtr = phys ? physmapPtr(phys, 0x1000) : nullptr;
+		lastPage = lastPtr ? page : ~0ULL;
+		lastVmid = vmid;
+	}
+	return lastPtr ? reinterpret_cast<volatile uint32_t *>(lastPtr + (va & 0xFFF)) : nullptr;
+}
+
+static bool vceBridgeReloc(uint32_t vmid, uint64_t ibVa, uint32_t lo, uint32_t hi, uint64_t bytes) {
+	auto *pl = vceIbDword(vmid, ibVa + lo * 4);
+	uint32_t vlo = pl ? *pl : 0;
+	auto *ph = vceIbDword(vmid, ibVa + hi * 4);
+	uint32_t vhi = ph ? *ph : 0;
+	uint64_t addr = static_cast<uint64_t>(vhi) << 32 | vlo;
+	if (!pl || !ph || !addr)
+		return false;
+	uint64_t g = vceBridgeMap(vmid, addr, bytes);
+	if (!g)
+		return false;  // not a VMID address (already rewritten, or unmapped): left as it is
+	pl = vceIbDword(vmid, ibVa + lo * 4);
+	if (pl)
+		*pl = static_cast<uint32_t>(g);
+	ph = vceIbDword(vmid, ibVa + hi * 4);
+	if (ph)
+		*ph = static_cast<uint32_t>(g >> 32);
+	vceBridge.relocs++;
+	return true;
+}
+
+// Which of Apple's packets does VCE here not take? (da77116 log 1747552594: Apple's create IB, bridged to VMID 0, still
+// gives no fence, where Linux's create message runs.) Apple's IB (built for Baffin) has three packets Mesa's VCE 52
+// encoder doesn't send on Stoney: hw config 0x0500000C (the kernel takes it only on Kaveri, Mullins and Carrizo:
+// "needed for proper VCE DPM on some APUs"), the clock table 0x05000009, and the aux buffer 0x05000002 (Mesa: only
+// with dual_pipe, off for Stoney and Polaris 11/12). On the first bridged create IB, three copies (relocated addresses,
+// their own session handles 7-9) go out on ring 1 under VMID 0 before Apple's: without all three, without hw config and
+// clock table, without hw config. Fences 0xCAFE0007-9 to our region +0x110/+0x114/+0x118. The first that lands names
+// the packet; one that fails may stop the ones after it. Answered (log 1747553499: the clock table), so -crvcevariants
+// only.
+static void vceSendVariants(uint32_t vmid, uint64_t ibVa, uint32_t len) {
+	auto *b = static_cast<uint8_t *>(vceRing1);
+	auto *region = smuLoad.mc ? carvePtr(smuLoad.phys + Smu8::VcePdOffset, 0x4000) : nullptr;
+	if (vceVariantsSent || !b || !region || !vceRing1Mc || len > 0x100 || !checkKernelArgument("-crvcevariants"))
+		return;
+	vceVariantsSent = 1;
+	uint32_t ib[0x100];
+	for (uint32_t i = 0; i < len; i++) {
+		auto *p = vceIbDword(vmid, ibVa + i * 4);
+		ib[i] = p ? *p : 0;
+	}
+	bool isCreate = false;
+	for (uint32_t idx = 0; idx + 1 < len && ib[idx] >= 8 && !(ib[idx] & 3); idx += ib[idx] / 4)
+		isCreate |= ib[idx + 1] == 0x01000001;
+	if (!isCreate) {
+		vceVariantsSent = 0;
+		return;
+	}
+	auto *ring = *reinterpret_cast<uint32_t **>(b + 0x40);
+	uint32_t size = *reinterpret_cast<uint32_t *>(b + 0x30);
+	if (!ring || size < 0x8000)
+		return;
+	static const uint32_t drops[3][3] {{0x0500000C, 0x05000009, 0x05000002}, {0x0500000C, 0x05000009, 0}, {0x0500000C, 0, 0}};
+	uint64_t mc = smuLoad.mc + Smu8::VcePdOffset;
+	for (uint32_t v = 0; v < 3; v++) {
+		// ring 1's GART pages from size/2 + 0x1000 on (the VMID 0 system memory probe uses the first one)
+		uint32_t pageDw = size / 2 + 0x400 * (v + 1);
+		uint32_t *dst = ring + pageDw;
+		uint32_t n = 0;
+		for (uint32_t idx = 0; idx + 1 < len && ib[idx] >= 8 && !(ib[idx] & 3); idx += ib[idx] / 4) {
+			uint32_t cmd = ib[idx + 1], words = ib[idx] / 4;
+			if (cmd == drops[v][0] || cmd == drops[v][1] || cmd == drops[v][2] || n + words > 0x400)
+				continue;
+			memcpy(dst + n, ib + idx, words * 4);
+			if (cmd == 0x00000001)
+				dst[n + 2] = 7 + v;  // own session handle
+			n += words;
+		}
+		flushLines(reinterpret_cast<const uint8_t *>(dst), 0x1000);
+		uint32_t off = 0x110 + v * 4;
+		*reinterpret_cast<volatile uint32_t *>(region + off) = 0;
+		uint64_t ibGart = vceRing1Mc + static_cast<uint64_t>(pageDw) * 4;
+		uint32_t cmd[] {0x102, 0, static_cast<uint32_t>(ibGart), static_cast<uint32_t>(ibGart >> 32), n, 3,
+			static_cast<uint32_t>(mc + off), static_cast<uint32_t>((mc + off) >> 32), VceProbeValue + 6 + v, 1};
+		bool sent = vceRing1Send(cmd, arrsize(cmd));
+		diskLogEvent("vce variant %u: Apple's create IB without %x %x %x: %u of %u dwords, IB gart %llx, %s", v + 7,
+			drops[v][0], drops[v][1], drops[v][2], n, len, ibGart, sent ? "sent" : "ring 1 not usable");
+		if (sent)
+			vceVariantsSent = 2;
+	}
+}
+
+// 9ba44fb log 1747553499: Apple's create IB without hw config and the clock table ran (0xCAFE0008), without hw config
+// alone it didn't (0xCAFE0009): VCE here doesn't take Apple's clock table (0x05000009, all zeros), and Mesa's VCE 52
+// encoder sends neither packet on Stoney. Remove both from each of Apple's IBs (in place; the length shrinks), fixing
+// a task info's offsetOfNextTaskInfo (dword 2; 0xFFFFFFFF none) when packets between it and the next task info go.
+// Returns the new length. -crnovcefilter keeps them.
+static uint32_t vceFilterIb(uint32_t vmid, uint64_t ibVa, uint32_t len) {
+	static uint32_t filtered, logs;
+	if (len > 0x400 || checkKernelArgument("-crnovcefilter"))
+		return len;
+	static uint32_t ib[0x400], out[0x400], newAt[0x400 + 1];  // static: 12 KB is too much for a kernel stack
+	for (uint32_t i = 0; i < len; i++) {
+		auto *p = vceIbDword(vmid, ibVa + i * 4);
+		if (!p)
+			return len;
+		ib[i] = *p;
+	}
+	uint32_t n = 0, removed = 0, idx = 0;
+	while (idx < len) {
+		uint32_t words = ib[idx] / 4, cmd = idx + 1 < len ? ib[idx + 1] : 0;
+		if (ib[idx] < 8 || (ib[idx] & 3) || idx + words > len)
+			break;
+		bool drop = cmd == 0x05000009 || cmd == 0x0500000C;
+		for (uint32_t i = 0; i < words; i++)
+			newAt[idx + i] = n + (drop ? 0 : i);
+		if (drop) {
+			removed++;
+		} else {
+			memcpy(out + n, ib + idx, words * 4);
+			n += words;
+		}
+		idx += words;
+	}
+	if (!removed || idx != len)
+		return len;
+	newAt[len] = n;
+	// task info offsets (Mesa's task_info: offs = next task info packet - this packet + 3)
+	for (uint32_t i = 0; i + 2 < len;) {
+		uint32_t words = ib[i] / 4;
+		if (ib[i + 1] == 0x00000002 && ib[i + 2] != 0xFFFFFFFF && i + ib[i + 2] >= 3) {
+			uint32_t target = i + ib[i + 2] - 3;
+			if (target <= len && target > i)
+				out[newAt[i] + 2] = newAt[target] - newAt[i] + 3;
+		}
+		i += words;
+	}
+	for (uint32_t i = 0; i < n; i++) {
+		auto *p = vceIbDword(vmid, ibVa + i * 4);
+		if (p)
+			*p = out[i];
+	}
+	filtered++;
+	if (logs++ < 6)
+		diskLogEvent("vce filter: IB %llx: %u packet(s) removed (clock table / hw config), %u -> %u dwords (%u IBs so far)",
+			ibVa, removed, len, n, filtered);
+	return n;
+}
+
+// Any (hi, lo) dword pair in a packet Linux doesn't know that is an address in the VMID's range with a valid PTE:
+// logged, and relocated only with -crvceguess (c83b5d3 relocated by default, and corrupted the encode packet's
+// reference picture fields).
+static void vceBridgeGuess(uint32_t vmid, uint64_t ibVa, uint32_t idx, uint32_t plen, uint32_t cmd) {
+	bool apply = checkKernelArgument("-crvceguess");
+	auto at = [&](uint32_t i) {
+		auto *p = vceIbDword(vmid, ibVa + (idx + i) * 4);
+		return p ? *p : 0;
+	};
+	uint64_t vmLo = static_cast<uint64_t>(gpuMmio[0x558]) << 12, vmHi = (static_cast<uint64_t>(gpuMmio[0x560]) + 1) << 12;
+	static uint32_t guessLogs;
+	for (uint32_t k = 2; k + 1 < plen / 4; k++) {
+		uint64_t addr = static_cast<uint64_t>(at(k)) << 32 | at(k + 1);
+		if (addr < vmLo || addr >= vmHi || !vmPteRaw(vmid, addr))
+			continue;
+		bool ok = apply && vceBridgeReloc(vmid, ibVa, idx + k + 1, idx + k, 0x400000);
+		if (guessLogs++ < 24)
+			diskLogEvent("vce bridge: packet %x dword %u/%u: va %llx looks like an address%s", cmd, k, k + 1, addr,
+				ok ? ", relocated" : apply ? ", not mapped" : " (left)");
+		k++;
+	}
+}
+
+// A ring block (IB_VM vmid, IB lo, hi, length, then Apple's FENCE/TRAP/END) moved to VMID 0. False: left alone.
+static bool vceBridgeBlock(uint32_t *blk) {
+	auto &b = vceBridge;
+	if (checkKernelArgument("-crnovcebridge") || !vceBridgeInit())
+		return false;
+	uint32_t vmid = blk[1];
+	uint64_t ibVa = static_cast<uint64_t>(blk[3]) << 32 | blk[2];
+	uint32_t len = blk[4];
+	if (!vmid || !len || len > 0x4000)
+		return false;
+	vceBridgeJob++;
+	uint64_t ibGart = vceBridgeMap(vmid, ibVa, static_cast<uint64_t>(len) * 4);
+	if (!ibGart)
+		return false;
+	// Linux's relocations (amdgpu_vce_ring_parse_cs, physical mode), with the extents it checks; Apple's extra
+	// packets (clock table 0x05000009, hw config 0x0500000C, aux 0x05000002) carry no address.
+	constexpr uint64_t Mb = 0x100000;
+	uint32_t fbIdx = 0, bsIdx = 0, packets = 0;
+	for (uint32_t idx = 0; idx < len && packets < 64; packets++) {
+		auto *pl = vceIbDword(vmid, ibVa + idx * 4);
+		uint32_t plen = pl ? *pl : 0;
+		auto *pc = vceIbDword(vmid, ibVa + (idx + 1) * 4);
+		uint32_t cmd = pc ? *pc : 0;
+		if (plen < 8 || (plen & 3) || idx + plen / 4 > len) {
+			b.badLen++;
+			break;
+		}
+		auto at = [&](uint32_t i) {
+			auto *p = vceIbDword(vmid, ibVa + (idx + i) * 4);
+			return p ? *p : 0;
+		};
+		switch (cmd) {
+			case 0x00000002:  // task info
+				fbIdx = at(6) == 0xFFFFFFFF ? 0 : at(6);
+				bsIdx = at(7) == 0xFFFFFFFF ? 0 : at(7);
+				break;
+			case 0x03000001:  // encode: luma, chroma (Linux); any other address Apple's version carries
+				if (static bool encDumped; !encDumped) {
+					encDumped = true;
+					char buf[400];
+					size_t pos = 0;
+					for (uint32_t i = 0; i < plen / 4 && i < 40 && pos + 12 < sizeof(buf); i++)
+						pos += snprintf(buf + pos, sizeof(buf) - pos, " %x", at(i));
+					diskLogEvent("vce bridge: encode packet (len %x) of IB %llx:%s", plen, ibVa, buf);
+				}
+				// Only these two: Mesa's encode packet gives the reference pictures as offsets in the context buffer
+				// (with type, frame number, POC), which c83b5d3's guess took for addresses at dwords 57-83.
+				vceBridgeReloc(vmid, ibVa, idx + 10, idx + 9, 4 * Mb);
+				vceBridgeReloc(vmid, ibVa, idx + 12, idx + 11, 2 * Mb);
+				break;
+			case 0x0500000A:  // Apple's: a per-frame buffer (hi, lo, size, count; log 1747555076: 4 28000 3000 2)
+				vceBridgeReloc(vmid, ibVa, idx + 3, idx + 2, at(4) ? static_cast<uint64_t>(at(4)) * (at(5) ? at(5) : 1) : 0x8000);
+				break;
+			case 0x0500000B: case 0x04000003: case 0x0400000E:  // Apple's, no address (log 1747555076)
+				break;
+			case 0x05000001:  // context buffer
+				vceBridgeReloc(vmid, ibVa, idx + 3, idx + 2, 8 * Mb);
+				break;
+			case 0x05000004:  // bitstream
+				vceBridgeReloc(vmid, ibVa, idx + 3, idx + 2, static_cast<uint64_t>(at(4)) * (bsIdx + 1));
+				break;
+			case 0x05000005:  // feedback
+				vceBridgeReloc(vmid, ibVa, idx + 3, idx + 2, 4096ULL * (fbIdx + 1));
+				break;
+			case 0x0500000D:  // MV buffers
+				vceBridgeReloc(vmid, ibVa, idx + 3, idx + 2, 4 * Mb);
+				vceBridgeReloc(vmid, ibVa, idx + 8, idx + 7, 1 * Mb);
+				break;
+			case 0x00000001: case 0x01000001: case 0x02000001: case 0x04000001: case 0x04000002: case 0x04000005:
+			case 0x04000007: case 0x04000008: case 0x04000009: case 0x05000002: case 0x05000009: case 0x0500000C:
+				break;
+			default: {
+				// Apple's own packets (38797f2 log 1747554394: 0x04000003, 0x0400000E, 0x0500000A, 0x0500000B; after 14
+				// jobs VCE0 faulted under VMID 0 at VA 4:00070000, an address left in one of them). Each one's dwords
+				// are logged the first time, and any (hi, lo) dword pair in it that is a VMID address with a valid
+				// PTE is relocated like the known buffers (logged). -crnovceguess leaves them.
+				b.unknownCmds++;
+				static uint32_t dumped[16], dumpedNum;
+				bool seen = false;
+				for (uint32_t i = 0; i < dumpedNum; i++)
+					seen |= dumped[i] == cmd;
+				if (!seen && dumpedNum < arrsize(dumped)) {
+					dumped[dumpedNum++] = cmd;
+					char buf[200];
+					size_t pos = 0;
+					for (uint32_t i = 0; i < plen / 4 && i < 16 && pos + 12 < sizeof(buf); i++)
+						pos += snprintf(buf + pos, sizeof(buf) - pos, " %x", at(i));
+					diskLogEvent("vce bridge: unknown packet %x (len %x) at dword %x of IB %llx:%s", cmd, plen, idx, ibVa,
+						buf);
+				}
+				vceBridgeGuess(vmid, ibVa, idx, plen, cmd);
+				break;
+			}
+		}
+		idx += plen / 4;
+	}
+	__asm__ volatile("mfence" ::: "memory");
+	if (b.dirty) {
+		gpuMmio[0x51E] = 1;  // VM_INVALIDATE_REQUEST, context 0 (gmc_v8_0_flush_gpu_tlb)
+		b.dirty = false;
+	}
+	vceSendVariants(vmid, ibVa, len);
+	blk[4] = vceFilterIb(vmid, ibVa, len);
+	blk[1] = 0;
+	blk[2] = static_cast<uint32_t>(ibGart);
+	blk[3] = static_cast<uint32_t>(ibGart >> 32);
+	flushLines(reinterpret_cast<const uint8_t *>(blk), 0x20);
+	if (b.blocks++ < 12)
+		diskLogEvent("vce bridge: IB %llx (vmid %u, %u dwords, %u packets) -> gart %llx; maps %u (%u pages) reused %u "
+			"relocs %u fails %u unknown %u", ibVa, vmid, len, packets, ibGart, b.maps, b.pages, b.reuses, b.relocs,
+			b.mapFails, b.unknownCmds);
+	return true;
+}
+
+// UVD through the same bridge (-cruvd). Stoney's UVD 6.2 has no VM (Linux: uvd_v6_0_ring_vm_funcs only from Polaris
+// 10; Carrizo/Stoney run uvd_v6_0_ring_phys_funcs), and Apple's IBs are at VMID 7 addresses (nvram17: IB 4:00000000,
+// VMID 7). Apple's ring frame (AMDUVD6v3DecChannel::initializeIndirectCommandBufferFrame, Monterey) is 0x40 dwords of
+// (register, value) pairs, NO_OP (0x3BFF) filled: UVD_LMI_RBC_IB_VMID 0x3DA1, IB_64BIT_BAR_HIGH 0x3C66, _LOW 0x3C67,
+// UVD_RBC_IB_SIZE 0x3DA2, then the fence (CONTEXT_ID 0x3DBD, GPCOM DATA1/DATA0/CMD 0x3BC5/0x3BC4/0x3BC3, in the ring
+// under VMID 0 already). In the IB, Linux's amdgpu_uvd_cs_reg: PACKET0 writes, GPCOM_VCPU_DATA0/DATA1 hold an address
+// that each GPCOM_VCPU_CMD write (value >> 1: 0 message, 1 DPB, 2 decode target, 3 feedback, 0x100 bitstream, 0x204,
+// 0x206 context) uses; UVD 6 takes 64-bit addresses (address_64_bit from UVD 5). -crnouvdbridge leaves them.
+static struct {
+	uint32_t rings, ibs, relocs, unknown, bad, sessCtxDropped, vmid;
+	uint64_t dtVa, fbVa, firstMs;  // the last decode target / feedback (VMID addresses), for the watcher's samples
+	uint64_t bsVa, dpbVa, ctxVa;   // and bitstream (0x100), DPB (1), H264_PERF context (0x206)
+} uvdBridge;
+
+// a712cf8 log 1794546450: the first frame's luma has data in rows 0-47 only (3 macroblock rows), the firmware wrote its
+// status, and later frames are not decoded at all. Apple's messages keep H264_PERF's macroblock context in a separate
+// buffer (cmd 0x206, msg dpb_reserved), Polaris style; Mesa never does that on Stoney: there the context lives in the
+// DPB, sized as Linux's amdgpu_uvd_cs_msg_decode does without use_ctx_buf: images x N + macroblock context
+// (wmb x hmb x N x 192) + IT surface (wmb x hmb x 32). Our own DPB of that size (system memory, in the window's fixed
+// top slots), dpb_size set to it, dpb_reserved 0, the DPB command pointed at it and the 0x206 command a NO_OP.
+// N is Apple's own count (its DPB size / image size). Opt-in (-cruvdowndpb): it decoded nothing, with either firmware.
+static struct {
+	IOBufferMemoryDescriptor *buf;
+	uint32_t pages, uses;
+	uint64_t gart;
+	bool failed;
+} uvdOwnDpb;
+
+static uint64_t uvdOwnDpbMap(uint32_t bytes) {
+	auto &d = uvdOwnDpb;
+	auto &b = vceBridge;
+	uint32_t pages = (bytes + 0xFFF) >> 12;
+	if (d.buf && d.pages >= pages)
+		return d.gart;
+	if (d.failed || !b.uvdDpbSlot || pages > VceBridgeUvdDpbSlots)
+		return 0;
+	OSSafeReleaseNULL(d.buf);
+	auto *buf = IOBufferMemoryDescriptor::withOptions(kIODirectionInOut, static_cast<vm_size_t>(pages) << 12, PAGE_SIZE);
+	if (!buf || buf->prepare() != kIOReturnSuccess) {
+		OSSafeReleaseNULL(buf);
+		d.failed = true;
+		diskLogEvent("uvd dpb: can't allocate %u pages", pages);
+		return 0;
+	}
+	bzero(buf->getBytesNoCopy(), static_cast<size_t>(pages) << 12);
+	for (uint32_t i = 0; i < pages; i++) {
+		IOByteCount len = 0;
+		addr64_t pa = buf->getPhysicalSegment(static_cast<IOByteCount>(i) << 12, &len, kIOMemoryMapperNone);
+		b.pte[b.uvdDpbSlot + i] = (pa & ~0xFFFULL) | 0x77;  // valid, system, snooped, readable, writeable (as the GART's own)
+	}
+	b.dirty = true;
+	d.buf = buf;
+	d.pages = pages;
+	d.gart = b.windowVa + (static_cast<uint64_t>(b.uvdDpbSlot) << 12);
+	diskLogEvent("uvd dpb: own DPB of %u pages at gart %llx", pages, d.gart);
+	return d.gart;
+}
+
+static uint64_t uvdCmdExtent(uint32_t cmd) {
+	switch (cmd) {
+		case 0: case 3: return 0x10000;      // message, feedback (Linux checks 2048)
+		case 1: return 0x4000000;            // DPB
+		case 2: return 0x1000000;            // decode target
+		case 0x100: return 0x800000;         // bitstream
+		default: return 0x400000;            // 0x204, 0x206 and the rest
+	}
+}
+
+static bool uvdBridgeIb(uint32_t vmid, uint64_t ibVa, uint32_t len, uint64_t &ibGart) {
+	ibGart = vceBridgeMap(vmid, ibVa, static_cast<uint64_t>(len) * 4);
+	if (!ibGart)
+		return false;
+	auto at = [&](uint32_t i) {
+		auto *p = vceIbDword(vmid, ibVa + i * 4);
+		return p ? *p : 0;
+	};
+	uint32_t data0 = ~0U, data1 = ~0U, cmds = 0;
+	static uint32_t cmdLogs, regLog[48][2], regLogNum, msgDumps;
+	uint64_t msgVa = 0, ownDpb = 0;
+	for (uint32_t idx = 0; idx < len;) {
+		uint32_t hdr = at(idx), type = hdr >> 30;
+		if (type == 2) {  // PACKET2 filler
+			idx++;
+			continue;
+		}
+		if (type != 0) {
+			if (uvdBridge.bad++ < 4)
+				diskLogEvent("uvd bridge: IB %llx dword %x: packet type %u (%x), stopped", ibVa, idx, type, hdr);
+			break;
+		}
+		uint32_t reg = hdr & 0xFFFF, count = (hdr >> 16) & 0x3FFF;
+		for (uint32_t i = 0; i <= count && idx + 1 + i < len; i++) {
+			uint32_t r = reg + i, at1 = idx + 1 + i;
+			// 1b3f5d0 log 1794536434: the GPCOM commands start at dword 0xA1; which registers does the rest write?
+			bool known = false;
+			for (uint32_t k = 0; k < regLogNum; k++)
+				known |= regLog[k][0] == r;
+			if (!known && regLogNum < arrsize(regLog) && r != 0x3BFF) {
+				regLog[regLogNum][0] = r;
+				regLog[regLogNum++][1] = at(at1);
+				diskLogEvent("uvd bridge: IB %llx writes reg %x = %x (dword %x)", ibVa, r, at(at1), at1);
+			}
+			if (r == 0x3BC4)
+				data0 = at1;
+			else if (r == 0x3BC5)
+				data1 = at1;
+			else if (r == 0x3BC3) {
+				uint32_t cmd = at(at1) >> 1;
+				cmds++;
+				if (cmd == 0 && data0 != ~0U && data1 != ~0U)
+					msgVa = static_cast<uint64_t>(at(data1)) << 32 | at(data0);
+				// A decode message for H264_PERF: move the macroblock context into our own DPB (see uvdOwnDpb).
+				// Decode messages as Mesa writes them (radeon_uvd.c ruvd_end_frame), on every chip Polaris included:
+				// decode_flags 1 (Apple 0), and for a progressive frame the bottom-field offsets equal the top ones (Apple
+				// puts the plane ends there: luma bottom 0x17ffff, chroma bottom 0x23ffff). 9177161 log 1794547579 and before:
+				// the decoder stops after three macroblock rows whatever the firmware or context layout. -crnouvdmesamsg
+				// keeps Apple's. Also log Apple's dwords where Mesa's message has extension_support (byte 0xce0).
+				if (cmd == 0 && msgVa && !checkKernelArgument("-crnouvdmesamsg")) {
+					auto rd = [&](uint32_t i) {
+						auto *p = vceIbDword(vmid, msgVa + i * 4);
+						return p ? *p : 0;
+					};
+					auto wr = [&](uint32_t i, uint32_t v) {
+						if (auto *p = vceIbDword(vmid, msgVa + i * 4))
+							*p = v;
+					};
+					if (rd(1) == 1 && rd(0) >= 0x90) {
+						uint32_t flags = rd(5), lumaBottom = rd(33), chromaBottom = rd(35);
+						bool field = rd(31) != 0;  // dt_field_mode
+						if (!field) {
+							wr(5, 1);
+							wr(33, rd(32));
+							wr(35, rd(34));
+						}
+						static uint32_t msgFixLogs;
+						if (msgFixLogs++ < 2)
+							diskLogEvent("uvd msg: decode flags %x -> %x, luma bottom %x -> %x, chroma bottom %x -> %x (field %u); "
+								"size %x, dwords at 0xce0: %x %x %x %x", flags, rd(5), lumaBottom, rd(33), chromaBottom, rd(35),
+								field, rd(0), rd(0xCE0 / 4), rd(0xCE0 / 4 + 1), rd(0xCE0 / 4 + 2), rd(0xCE0 / 4 + 3));
+					}
+				}
+				// Opt-in experiment (-cruvdowndpb): neither Apple's Polaris firmware (805b16e log 1794547065) nor Stoney's
+				// (ef25f06 log 1794547579) decoded anything with the context in the DPB.
+				if (cmd == 0 && msgVa && checkKernelArgument("-cruvdowndpb")) {
+					auto msg = [&](uint32_t i) {
+						auto *p = vceIbDword(vmid, msgVa + i * 4);
+						return p ? *p : 0;
+					};
+					if (msg(1) == 1 && msg(4) == 7 && msg(6) && msg(7) && msg(9)) {
+						uint32_t w = msg(6), h = msg(7), wmb = w / 16, hmb = ((h / 16) + 1) & ~1U;
+						uint32_t image = ((w * h + w * h / 2) + 1023) & ~1023U, num = msg(9) / image;
+						if (num < 1)
+							num = 1;
+						uint32_t size = ((image * num + wmb * hmb * num * 192 + wmb * hmb * 32) + 0xFFF) & ~0xFFFU;
+						uint32_t oldDpb = msg(9), oldReserved = msg(11);
+						ownDpb = uvdOwnDpbMap(size);
+						if (ownDpb) {
+							if (auto *p = vceIbDword(vmid, msgVa + 9 * 4))
+								*p = size;
+							if (auto *p = vceIbDword(vmid, msgVa + 11 * 4))
+								*p = 0;
+							static uint32_t dpbLogs;
+							if (dpbLogs++ < 2)
+								diskLogEvent("uvd dpb: decode %ux%u, %u pictures: dpb %x -> %x (context inside), reserved %x -> 0",
+									w, h, num, oldDpb, size, oldReserved);
+						}
+					}
+				}
+				if (cmd == 1 && ownDpb && data0 != ~0U && data1 != ~0U) {
+					if (auto *p = vceIbDword(vmid, ibVa + data0 * 4))
+						*p = static_cast<uint32_t>(ownDpb);
+					if (auto *p = vceIbDword(vmid, ibVa + data1 * 4))
+						*p = static_cast<uint32_t>(ownDpb >> 32);
+					data0 = data1 = ~0U;
+					continue;
+				}
+				if (cmd == 0x206 && ownDpb && count == 0) {
+					if (auto *h = vceIbDword(vmid, ibVa + idx * 4))
+						*h = 0x3BFF;
+					data0 = data1 = ~0U;
+					continue;
+				}
+				if (data0 != ~0U && data1 != ~0U) {
+					uint64_t a = static_cast<uint64_t>(at(data1)) << 32 | at(data0);
+					if (cmd == 0x100)
+						uvdBridge.bsVa = a;
+					else if (cmd == 1)
+						uvdBridge.dpbVa = a;
+					else if (cmd == 0x206)
+						uvdBridge.ctxVa = a;
+				}
+				if ((cmd == 2 || cmd == 3) && data0 != ~0U && data1 != ~0U) {
+					(cmd == 2 ? uvdBridge.dtVa : uvdBridge.fbVa) = static_cast<uint64_t>(at(data1)) << 32 | at(data0);
+					uvdBridge.vmid = vmid;
+					if (!uvdBridge.firstMs)
+						uvdBridge.firstMs = uptimeMs();
+				}
+				// 8308b57 log 1794538811: the first job (cmd 5 + the create message) already hangs. Mesa sends the
+				// session context buffer (RUVD_CMD_SESSION_CONTEXT_BUFFER, 5) only from Polaris 10 on, never on Stoney;
+				// Apple's Polaris userspace sends it first in every IB. Turn that CMD write into a UVD_NO_OP write
+				// (Apple writes one register per PACKET0). -cruvdsessctx keeps it.
+				if (cmd == 5 && count == 0 && !checkKernelArgument("-cruvdsessctx")) {
+					if (auto *h = vceIbDword(vmid, ibVa + idx * 4)) {
+						*h = 0x3BFF;
+						uvdBridge.sessCtxDropped++;
+					}
+					data0 = data1 = ~0U;
+					continue;
+				}
+				if (data0 != ~0U && data1 != ~0U && vceBridgeReloc(vmid, ibVa, data0, data1, uvdCmdExtent(cmd)))
+					uvdBridge.relocs++;
+				if (cmdLogs++ < 16)
+					diskLogEvent("uvd bridge: IB %llx cmd %x (dword %x), address dwords %x/%x", ibVa, cmd, at1, data0, data1);
+				if (cmd != 0 && cmd != 1 && cmd != 2 && cmd != 3 && cmd != 0x100 && cmd != 0x204 && cmd != 0x206)
+					uvdBridge.unknown++;
+				data0 = data1 = ~0U;
+			}
+		}
+		idx += count + 2;
+	}
+	// The message (create, then decode): compare with Linux's amdgpu_uvd_cs_msg / Mesa's ruvd_msg layout.
+	if (msgVa && msgDumps < 2) {
+		msgDumps++;
+		char buf[400];
+		size_t pos = 0;
+		for (uint32_t i = 0; i < 40 && pos + 12 < sizeof(buf); i++) {
+			auto *p = vceIbDword(vmid, msgVa + i * 4);
+			pos += snprintf(buf + pos, sizeof(buf) - pos, " %x", p ? *p : 0xDEADu);
+		}
+		diskLogEvent("uvd bridge: message at va %llx:%s", msgVa, buf);
+	}
+	return true;
+}
+
+static void uvdBridgeRing(void *that) {
+	auto &u = uvdBridge;
+	if (checkKernelArgument("-crnouvdbridge") || !gpuMmio || !vceBridgeInit())
+		return;
+	auto *b = static_cast<uint8_t *>(that);
+	auto *ring = *reinterpret_cast<uint32_t **>(b + 0x40);
+	uint32_t size = *reinterpret_cast<uint32_t *>(b + 0x30), tail = *reinterpret_cast<uint32_t *>(b + 0x54),
+			 pos = *reinterpret_cast<uint32_t *>(b + 0x74);
+	if (!ring || !size || size > 0x100000 || tail >= size || pos >= size)
+		return;
+	u.rings++;
+	// 61a9714 log 1794540246: decode ran but the target's luma stayed 0 and chroma 0x80 / ff00ff00; UVD_UDEC_ADDR_CONFIG,
+	// _DB_ and _DBW_ (0x3BD3-5) held 0x2011003 (Polaris-style: 8 pipes, row size 1) where Stoney's GB_ADDR_CONFIG is
+	// 0x2010001. Linux's uvd_v6_0_mc_resume sets all three to GB_ADDR_CONFIG. -crnouvdaddrcfg leaves them.
+	// d219732 log 1794544167: Stoney's own firmware decodes exactly as Apple's did (first rows only), so it's the hardware
+	// set-up. Linux's uvd_v6_0_start programs UVD_LMI_CTRL (0x302340: write clean timer 0x40 + enable, request mode, data
+	// and VCPU data coherency, disable on FWV fail), LMI/MP swap 0 and the MPC mux (MUXA0/B0 0x40c2040, A1/B1 0, MUX 0x88,
+	// ALU 0); Apple's CAIL does its Polaris version. Log Apple's values (and the clock gating) once, then set Linux's
+	// before each submit. -crnouvdlinuxregs keeps Apple's.
+	{
+		auto *m = gpuMmio;
+		static const struct {
+			uint16_t reg;
+			uint32_t value;
+		} linuxRegs[] {{0x3D66, 0x302340}, {0x3D6D, 0}, {0x3D6F, 0}, {0x3D79, 0x40C2040}, {0x3D7A, 0}, {0x3D7B, 0x40C2040},
+			{0x3D7C, 0}, {0x3D7E, 0}, {0x3D7D, 0x88}};
+		static bool logged;
+		if (!logged) {
+			logged = true;
+			diskLogEvent("uvd regs (Apple): LMI_CTRL %x LMI_SWAP %x MP_SWAP %x MUXA0 %x A1 %x B0 %x B1 %x MUX %x ALU %x; "
+				"LMI_CTRL2 %x MASTINT_EN %x CGC_CTRL %x CGC_GATE %x SUVD_CGC_CTRL %x SUVD_CGC_GATE %x", m[0x3D66], m[0x3D6D],
+				m[0x3D6F], m[0x3D79], m[0x3D7A], m[0x3D7B], m[0x3D7C], m[0x3D7D], m[0x3D7E], m[0x3D3D], m[0x3D40], m[0x3D2C],
+				m[0x3D2A], m[0x3BE6], m[0x3BE4]);
+		}
+		if (!checkKernelArgument("-crnouvdlinuxregs")) {
+			static uint32_t regFixes;
+			uint32_t changed = 0;
+			for (auto &r : linuxRegs)
+				if (m[r.reg] != r.value) {
+					m[r.reg] = r.value;
+					changed++;
+				}
+			if (changed && regFixes++ < 4)
+				diskLogEvent("uvd regs: %u set to Linux's values; now LMI_CTRL %x MUXA0 %x MUXB0 %x MUX %x", changed, m[0x3D66],
+					m[0x3D79], m[0x3D7B], m[0x3D7D]);
+		}
+	}
+	if (!checkKernelArgument("-crnouvdaddrcfg")) {
+		auto *m = gpuMmio;
+		uint32_t gb = m[0x263E];
+		static uint32_t fixes;
+		if (gb && gb != 0xFFFFFFFF && (m[0x3BD3] != gb || m[0x3BD4] != gb || m[0x3BD5] != gb)) {
+			uint32_t was = m[0x3BD3];
+			m[0x3BD3] = gb;
+			m[0x3BD4] = gb;
+			m[0x3BD5] = gb;
+			if (fixes++ < 4)
+				diskLogEvent("uvd bridge: UDEC addr config %x -> %x (now %x %x %x)", was, gb, m[0x3BD3], m[0x3BD4],
+					m[0x3BD5]);
+		}
+	}
+	// The new dwords, as (register, value) pairs: find each IB's VMID/BAR/size writes.
+	uint32_t vmidAt = ~0U, hiAt = ~0U, loAt = ~0U;
+	for (uint32_t n = 0; pos != tail && n < 0x4000; n += 2) {
+		uint32_t at = pos, next = (pos + 1) % size;
+		uint32_t reg = ring[at], value = ring[next];
+		if (reg == 0x3DA1)
+			vmidAt = next;
+		else if (reg == 0x3C66)
+			hiAt = next;
+		else if (reg == 0x3C67)
+			loAt = next;
+		else if (reg == 0x3DA2 && vmidAt != ~0U && hiAt != ~0U && loAt != ~0U) {
+			uint32_t vmid = ring[vmidAt];
+			uint64_t ibVa = static_cast<uint64_t>(ring[hiAt]) << 32 | ring[loAt];
+			uint64_t ibGart = 0;
+			if (vmid && vmid < 16 && value && value <= 0x4000)
+				vceBridgeJob++;
+			if (vmid && vmid < 16 && value && value <= 0x4000 && uvdBridgeIb(vmid, ibVa, value, ibGart)) {
+				ring[vmidAt] = 0;
+				ring[hiAt] = static_cast<uint32_t>(ibGart >> 32);
+				ring[loAt] = static_cast<uint32_t>(ibGart);
+				// One frame as sent (pairs from the IB's VMID write, through the fence).
+				if (!u.ibs) {
+					char buf[480];
+					size_t p = 0;
+					uint32_t start = vmidAt >= 9 ? vmidAt - 9 : 0;
+					for (uint32_t i = 0; i < 0x40 && p + 12 < sizeof(buf); i++)
+						p += snprintf(buf + p, sizeof(buf) - p, " %x", ring[(start + i) % size]);
+					diskLogEvent("uvd bridge: ring frame from %x:%s", start, buf);
+				}
+				if (u.ibs++ < 12)
+					diskLogEvent("uvd bridge: IB %llx (vmid %u, %u dwords) -> gart %llx; relocs %u, unknown cmds %u, "
+						"session context dropped %u", ibVa, vmid, value, ibGart, u.relocs, u.unknown, u.sessCtxDropped);
+			}
+			vmidAt = hiAt = loAt = ~0U;
+		}
+		pos = (pos + 2) % size;
+	}
+	__asm__ volatile("mfence" ::: "memory");
+	if (vceBridge.dirty) {
+		gpuMmio[0x51E] = 1;  // VM_INVALIDATE_REQUEST, context 0
+		vceBridge.dirty = false;
+	}
+}
+
+// f5db4a5 log 1794539686: decode runs (no hang, every job fences) but the picture is garbage. Apple's decode target is
+// linear (dt_array_mode 0, pitch 0x800, chroma at 0x180000, dt_wa_chroma_top_offset 0x400 as Mesa sets on Stoney).
+// From 2 s after the first decode, a few times: bytes of the last decode target's luma (rows 0, 200, 400) and chroma,
+// the feedback buffer's first dwords, and UVD_UDEC_ADDR_CONFIG / DB / DBW (Linux's mc_resume: GB_ADDR_CONFIG).
+static void uvdBridgeTick() {
+	auto &u = uvdBridge;
+	static uint32_t samples;
+	if (!u.firstMs || samples >= 5 || uptimeMs() < u.firstMs + 2000 + samples * 1000 || !gpuMmio || !videoPowered())
+		return;
+	samples++;
+	auto *m = gpuMmio;
+	auto bytes = [&](uint64_t va, char *out, size_t room) {
+		size_t p = 0;
+		for (uint32_t i = 0; i < 4 && p + 12 < room; i++) {
+			uint64_t phys = u.vmid ? ibVaToPhys(u.vmid, va + i * 4) : 0;
+			uint32_t v = 0xDEADDEAD;
+			if (phys)
+				ibReadPhys(phys, 4, &v, false);
+			p += snprintf(out + p, room - p, " %08x", v);
+		}
+	};
+	char y0[64], y1[64], y2[64], c0[64], fb[64];
+	bytes(u.dtVa, y0, sizeof(y0));
+	bytes(u.dtVa + 200 * 0x800 + 0x200, y1, sizeof(y1));
+	bytes(u.dtVa + 400 * 0x800 + 0x400, y2, sizeof(y2));
+	bytes(u.dtVa + 0x180000 + 100 * 0x800 + 0x200, c0, sizeof(c0));
+	bytes(u.fbVa, fb, sizeof(fb));
+	diskLogEvent("uvd sample %u: dt va %llx luma%s |%s |%s chroma%s; feedback va %llx:%s; UDEC addr config %x db %x dbw %x "
+		"(GB_ADDR_CONFIG %x)", samples, u.dtVa, y0, y1, y2, c0, u.fbVa, fb, m[0x3BD3], m[0x3BD4], m[0x3BD5], m[0x263E]);
+	// Is the input there (bitstream: H.264 data), and does the decoder write anything at all (DPB, context)?
+	char bs[64], dpb0[64], dpb1[64], dpb2[64], ctx[64];
+	bytes(u.bsVa, bs, sizeof(bs));
+	bytes(u.dpbVa, dpb0, sizeof(dpb0));
+	bytes(u.dpbVa + 0x100000, dpb1, sizeof(dpb1));
+	bytes(u.dpbVa + 0x300000, dpb2, sizeof(dpb2));
+	bytes(u.ctxVa, ctx, sizeof(ctx));
+	diskLogEvent("uvd sample %u: bitstream va %llx:%s; dpb va %llx:%s |%s |%s; ctx va %llx:%s", samples, u.bsVa, bs, u.dpbVa,
+		dpb0, dpb1, dpb2, u.ctxVa, ctx);
+	// 0e468cc log 1794545653: whatever changes (firmware, registers, mappings), only the start of each frame is written.
+	// How far exactly: every luma row (pitch 0x800, 768 rows) and chroma row (from 0x180000, 384 rows), first 16 bytes:
+	// rows with data, the last such row; and the feedback's first 16 dwords (the firmware's per-frame status).
+	if (u.dtVa && u.vmid) {
+		auto rowHasData = [&](uint64_t va) {
+			uint32_t v[4] {};
+			uint64_t phys = ibVaToPhys(u.vmid, va);
+			return phys && ibReadPhys(phys, sizeof(v), v, false) && (v[0] | v[1] | v[2] | v[3]);
+		};
+		uint32_t lumaRows = 0, lumaLast = 0, chromaRows = 0, chromaLast = 0;
+		for (uint32_t r = 0; r < 768; r++)
+			if (rowHasData(u.dtVa + static_cast<uint64_t>(r) * 0x800)) {
+				lumaRows++;
+				lumaLast = r;
+			}
+		for (uint32_t r = 0; r < 384; r++)
+			if (rowHasData(u.dtVa + 0x180000 + static_cast<uint64_t>(r) * 0x800)) {
+				chromaRows++;
+				chromaLast = r;
+			}
+		char fbs[200];
+		size_t p = 0;
+		for (uint32_t i = 0; i < 16 && p + 12 < sizeof(fbs); i++) {
+			uint32_t v = 0;
+			uint64_t phys = ibVaToPhys(u.vmid, u.fbVa + i * 4);
+			if (phys)
+				ibReadPhys(phys, 4, &v, false);
+			p += snprintf(fbs + p, sizeof(fbs) - p, " %x", v);
+		}
+		diskLogEvent("uvd sample %u: dt %llx luma rows with data %u (last %u), chroma %u (last %u); feedback:%s", samples,
+			u.dtVa, lumaRows, lumaLast, chromaRows, chromaLast, fbs);
+	}
+	// VM fault latches (context 0 is where the bridged UVD works), client as 4 characters.
+	uint32_t client = m[0x538];
+	diskLogEvent("uvd sample %u: ctx0 fault status %x page %x (va %llx) client %x (%c%c%c%c); ctx1-15 status %x page %x",
+		samples, m[0x536], m[0x53E], static_cast<uint64_t>(m[0x53E]) << 12, client, (client >> 24) & 0x7F ?: '.',
+		(client >> 16) & 0x7F ?: '.', (client >> 8) & 0x7F ?: '.', client & 0x7F ?: '.', m[0x537], m[0x53F]);
+}
+
+// For the VCE log: the walk's PTE flags, and the VMID's first directory entry.
+static uint64_t vmWalkInfo(uint32_t vmid, uint64_t va, uint32_t *flags, uint64_t *pde0) {
+	auto *mmio = gpuMmio;
+	if (!mmio || !vmid || vmid > 15)
+		return 0;
+	uint64_t pdb = static_cast<uint64_t>(vmid < 8 ? mmio[0x550 + vmid - 1] : mmio[0x50E + vmid - 8]) << 12;
+	if (pde0 && !ibReadPhys(ibMcToPhys(pdb, false), 8, pde0, false))
+		*pde0 = 0;
+	return ibVaToPhysWalk(vmid, va, nullptr, flags);
 }
 
 // Only with interpLock held.
@@ -11895,7 +13741,7 @@ static void captureUserIbs(char *out, size_t size) {
 void CRDriver::vmmPanic(void *vmm) {
 	// The state that decides this first (the panic log keeps the start): the fixes the sDMA channel depends on.
 	char reason[480];
-	snprintf(reason, sizeof(reason), "CarrizoRed: the GPU VM manager %p has no sDMA channel (+0x28 null) at a page-table "
+	snprintf(reason, sizeof(reason), "UnifiedRed: the GPU VM manager %p has no sDMA channel (+0x28 null) at a page-table "
 		"update; Apple's endVMPTUpdate would fault. hwsig %u found/%u missed, smu load %s (calls %u), sDMA1 dropped %u "
 		"aliased %u, sDMA0-only starts %u, accel guards failed %u (last %s), routes ok %u failed %u unverified %u (last %s), "
 		"kernel %d.%d.", vmm, hwsigResolved, hwsigMissed, smuLoad.result ? smuLoad.result : "not run", smuLoadCalls,
@@ -12054,6 +13900,18 @@ const char *CRDriver::composeReport(uint32_t t, const char *tree) {
 			s.data1, s.ctxId, s.semaTimeout, s.ringRead ? "" : " (not read)");
 		for (size_t i = 0; s.ringRead && i < arrsize(s.ring); i++)
 			add(" %x", s.ring[i]);
+		add("\n");
+	}
+	if (vceLive.tails) {
+		auto &v = vceLive;
+		add("vce live (writeTail %u, getHead %u, last at %llu ms):", v.tails, v.heads, v.ms);
+		for (size_t i = 0; i < arrsize(vceRegs); i++)
+			add(" %x=%x", vceRegs[i], v.regs[i]);
+		for (size_t r = 0; r < 2; r++) {
+			add("; ring %s%s:", r ? "llq" : "1", v.ringRead[r] ? "" : " (not read)");
+			for (size_t i = 0; v.ringRead[r] && i < arrsize(v.ring[r]); i++)
+				add(" %x", v.ring[r][i]);
+		}
 		add("\n");
 	}
 	if (smuDpm.done)
@@ -12693,7 +14551,7 @@ void CRDriver::checkDisplayRegs(uint32_t t) {
 		auto &reg = watchedRegs[i];
 		if (reg.pipe >= 0 && !powered[reg.pipe]) {
 			if (reg.valid && reg.changes++ < MaxPrintedChanges)
-				IOLog("CarrizoRed: t=%us p%d %s: pipe powered off\n", t, reg.pipe, reg.name);
+				IOLog("UnifiedRed: t=%us p%d %s: pipe powered off\n", t, reg.pipe, reg.name);
 			reg.valid = false;
 			continue;
 		}
@@ -12708,7 +14566,7 @@ void CRDriver::checkDisplayRegs(uint32_t t) {
 			char pipe[8] = "";
 			if (reg.pipe >= 0)
 				snprintf(pipe, sizeof(pipe), "p%d ", reg.pipe);
-			IOLog("CarrizoRed: t=%us %s%s 0x%X = 0x%08X%s%s\n", t, pipe, reg.name, reg.offset, value, was,
+			IOLog("UnifiedRed: t=%us %s%s 0x%X = 0x%08X%s%s\n", t, pipe, reg.name, reg.offset, value, was,
 				changes + 1 == MaxPrintedChanges ? ", further changes not shown" : "");
 		}
 		reg.value = value;
