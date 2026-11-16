@@ -283,6 +283,7 @@ static uint32_t gcn2ValueWrite(uint32_t dword, uint32_t v);
 static uint32_t gcn2ValueRead(uint32_t dword, uint32_t c);
 static void gcn2Breadcrumb(uint32_t t, const char *tree);
 static void gcn2PrintPreviousBoot();
+static void gcn2StageCrumb(const char *name, bool exit, uint32_t ret);
 // Tonga's IH_RB_CNTL / IH_CNTL as Apple last wrote them (see ihTongaWrite).
 static uint32_t ihTongaRbCntl, ihTongaCntl, ihTongaWrites;
 // A small leaf function's end: the first "pop rbp; ret" (these accessors keep frame pointers), else 0x80 bytes.
@@ -5086,6 +5087,8 @@ namespace {
 			case 5: arg = static_cast<uint32_t>(ac); break;
 		}
 		stageLastArg[N] = arg;
+		if (gcn2Gpu && (stages[N].kext == InHWLibs || stages[N].kext == InHWServices))
+			gcn2StageCrumb(stages[N].name, false, 0);
 		if (!strcmp(stages[N].name, "uc.dpPerform")) {
 			flipPipe = a;
 			flipPerformMs = uptimeMs();
@@ -5181,6 +5184,8 @@ namespace {
 		auto ret = FunctionCast(wrapStage<N>, stages[N].org)(a, b, c, d, e, f);
 		if (!strcmp(stages[N].name, "initializeProjectDependentResources"))
 			controllerReady = true;
+		if (gcn2Gpu && (stages[N].kext == InHWLibs || stages[N].kext == InHWServices))
+			gcn2StageCrumb(stages[N].name, true, static_cast<uint32_t>(ret));
 		traceEvent(stages[N].name, true, static_cast<uint32_t>(ret));
 		// Mode 5: d points at a status buffer the call fills (DP training: per-lane status read from the DPCD).
 		if (stages[N].arg == 5 && d)
@@ -15373,6 +15378,12 @@ static void gcn2Breadcrumb(uint32_t t, const char *tree) {
 		cailWaitFailures);
 	for (uint32_t i = 0; i < cailWaitFailures && i < 3; i++)
 		add(" [%x]&%x!=%x(%x)", cailWaitFails[i].reg, cailWaitFails[i].mask, cailWaitFails[i].value, cailWaitFails[i].read);
+	// Stages entered and not yet returned, with how long they've been open (the trace's tail can be all route notes).
+	add(" | open:");
+	uint64_t nowMs = uptimeMs();
+	for (size_t i = 0; i < MaxTraceStages; i++)
+		if (__atomic_load_n(&stageOpen[i], __ATOMIC_RELAXED) && stageNames[i])
+			add(" %s(%llus)", stageNames[i], (nowMs - stageEnterMs[i]) / 1000);
 	// The attach tree, one line per entry joined with ';' (accelerator, framebuffers, displays).
 	add(" | tree:");
 	for (const char *c = tree; c && *c && len + 2 < sizeof(text) - 400; c++)
@@ -15414,6 +15425,55 @@ static void gcn2PrintPreviousBoot() {
 	IOLog("UnifiedRed: ===== previous accelerated boot (UR-gcn2, %u bytes) =====\n", length);
 	for (uint32_t pos = 0; pos < length; pos += 90)
 		IOLog("UR| %.*s\n", static_cast<int>(length - pos < 90 ? length - pos : 90), text + pos);
+	// The last start-up stages it entered (gcn2StageCrumb): the final "enter" is where a frozen boot stopped.
+	if (auto *stage = OSDynamicCast(OSData, options->getProperty("UR-gcn2-stage"))) {
+		auto *st = static_cast<const char *>(stage->getBytesNoCopy());
+		uint32_t sl = stage->getLength();
+		for (uint32_t pos = 0; pos < sl; pos += 90)
+			IOLog("US| %.*s\n", static_cast<int>(sl - pos < 90 ? sl - pos : 90), st + pos);
+	}
 	IOLog("UnifiedRed: ===== end (printed again every 15 s for 90 s) =====\n");
 	OSSafeReleaseNULL(options);
+}
+
+// GCN 2 start-up stages, written to NVRAM (UR-gcn2-stage) as each one starts: a machine that freezes inside a stage
+// can't run the watcher any more, so the write has to happen before the stage's code does. CAIL/HWServices stages
+// only (they run in the accelerator's start thread), thread context with interrupts on, at most 250 writes, only
+// with acceleration requested. Exits are recorded (with their result) and go out with the next enter.
+static void gcn2StageCrumb(const char *name, bool exit, uint32_t ret) {
+	static IORegistryEntry *options;
+	static struct {
+		const char *name;
+		uint32_t ret;
+		bool exit;
+	} recent[12];
+	static uint32_t head, writes;
+	static int off = -1;  // no guard variables in the kernel: decide on first use
+	if (off < 0)
+		off = checkKernelArgument("-crnoaccel") || checkKernelArgument("-crnogcn2crumb");
+	if (off || !name)
+		return;
+	recent[head % arrsize(recent)] = {name, ret, exit};
+	head++;
+	if (exit || writes >= 250 || !ml_get_interrupts_enabled())
+		return;
+	if (!options && !(options = IORegistryEntry::fromPath("/options", gIODTPlane)))
+		return;
+	static char text[700];
+	size_t len = static_cast<size_t>(snprintf(text, sizeof(text), "%llu ms #%u ENTER %s | before:", uptimeMs(), writes,
+		name));
+	for (uint32_t i = head > arrsize(recent) ? head - arrsize(recent) : 0; i + 1 < head && len < sizeof(text); i++) {
+		auto &e = recent[i % arrsize(recent)];
+		len += static_cast<size_t>(snprintf(text + len, sizeof(text) - len, e.exit ? " %s=%x" : " >%s", e.name, e.ret));
+	}
+	if (len >= sizeof(text))
+		len = sizeof(text) - 1;
+	auto *data = OSData::withBytes(text, static_cast<unsigned>(len));
+	if (!data)
+		return;
+	options->setProperty("UR-gcn2-stage", data);
+	data->release();
+	options->setProperty("IONVRAM-FORCESYNCNOW-PROPERTY", "UR-gcn2-stage");
+	options->setProperty("IONVRAM-SYNCNOW-PROPERTY", "UR-gcn2-stage");
+	writes++;
 }
