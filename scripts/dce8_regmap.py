@@ -110,6 +110,11 @@ def main():
             (new, old, len(by_offset), same, moved, dropped, conflicts))
     for off in table:
         assert off < 0x10000 and (table[off] < 0x10000), hex(off)
+    # Writes dropped: GMC 8.1's memory controller registers outside the VM block (MC_CONFIG, client groups, arbiter,
+    # hub, sequencer, training, XPB, performance counters). On Polaris they tune its own GDDR5 controller; on the APU the
+    # controller is shared with the CPU and the firmware set it up. Reads still pass (through the table above).
+    gmc = regs(base / "gmc_8_1_d.h")
+    write_drop = sorted({off for name, off in gmc.items() if name.startswith("MC_") and not name.startswith("MC_VM_")})
 
     out = Path(__file__).resolve().parent.parent / "UnifiedRed" / "kern_dce8map.hpp"
     lines = [
@@ -146,6 +151,32 @@ def main():
         lines.append("\t\t" + " ".join(row))
     lines += [
         "\t};",
+        "",
+        "\t// Polaris offsets whose writes are dropped on GCN 2 (memory controller tuning, see the generator).",
+        "\tstatic constexpr uint16_t WriteDrop[] {",
+    ]
+    row = []
+    for off in write_drop:
+        row.append("0x%04X," % off)
+        if len(row) == 12:
+            lines.append("\t\t" + " ".join(row))
+            row = []
+    if row:
+        lines.append("\t\t" + " ".join(row))
+    lines += [
+        "\t};",
+        "",
+        "\tinline bool writeDropped(uint32_t from) {",
+        "\t\tsize_t lo = 0, hi = sizeof(WriteDrop) / sizeof(WriteDrop[0]);",
+        "\t\twhile (lo < hi) {",
+        "\t\t\tsize_t mid = (lo + hi) / 2;",
+        "\t\t\tif (WriteDrop[mid] < from)",
+        "\t\t\t\tlo = mid + 1;",
+        "\t\t\telse",
+        "\t\t\t\thi = mid;",
+        "\t\t}",
+        "\t\treturn lo < sizeof(WriteDrop) / sizeof(WriteDrop[0]) && WriteDrop[lo] == from;",
+        "\t}",
         "",
         "\t// Binary search; returns `from` itself for an offset that isn't listed.",
         "\tinline uint32_t translate(uint32_t from) {",

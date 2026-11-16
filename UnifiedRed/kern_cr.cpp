@@ -266,7 +266,7 @@ static char traceSummary[2560];
 // GCN 2 DCE 8 register translation (see dce8Translate).
 static bool dce8Remap;
 static mach_vm_address_t atomReadFn, atomReadEnd, atomWriteFn, atomWriteEnd, baffinReadFn, baffinReadEnd;
-static uint32_t dce8Moved, dce8Dropped, dce8DroppedWrites, dce8Atom, dce8LbFixes;
+static uint32_t dce8Moved, dce8Dropped, dce8DroppedWrites, dce8Atom, dce8LbFixes, dce8McWritesDropped;
 static uint8_t dce8DroppedSeen[0x10000 / 8];
 static uint32_t dce8DroppedFirst[48], dce8DroppedFirstCount;
 // GCN 2: the top of the carve-out kept from Apple's drivers (CONFIG_MEMSIZE reads Gcn2ReserveMb less through both
@@ -279,6 +279,10 @@ static bool gcn2Gpu;  // the iGPU is a GCN 2 APU (set at detection; for code tha
 static bool dce8Translate(uint32_t &byteOffset, bool write, uint32_t value, mach_vm_address_t ra);
 static uint32_t gcn2MemSizeRead(uint32_t dword, uint32_t value);
 static uint32_t gcn2MemSizeWrite(uint32_t dword, uint32_t value);
+static uint32_t gcn2ValueWrite(uint32_t dword, uint32_t v);
+static uint32_t gcn2ValueRead(uint32_t dword, uint32_t c);
+static void gcn2Breadcrumb(uint32_t t, const char *tree);
+static void gcn2PrintPreviousBoot();
 // Tonga's IH_RB_CNTL / IH_CNTL as Apple last wrote them (see ihTongaWrite).
 static uint32_t ihTongaRbCntl, ihTongaCntl, ihTongaWrites;
 // A small leaf function's end: the first "pop rbp; ret" (these accessors keep frame pointers), else 0x80 bytes.
@@ -1555,7 +1559,8 @@ void CRDriver::processPatcher(KernelPatcher &patcher) {
 	// so the EFI keeps them off the iGPU and the watcher, which normally starts with AMD9500Controller, starts here:
 	// it gives the report (crpanicat) with the PCI info, carve-out, GB_ADDR_CONFIG and the VBIOS source.
 	if (isGcn2(family)) {
-		SYSLOG("cr", "%s: observation only, Apple's drivers stay off", familyName(family));
+		gcn2PrintPreviousBoot();
+		SYSLOG("cr", "%s: watcher starts at detection", familyName(family));
 		startWatcher();
 	}
 }
@@ -4266,6 +4271,8 @@ void CRDriver::gcn2Watch() {
 				traceNote("LoadAccelerator@%us ", t);
 			}
 		}
+		if (!checkKernelArgument("-crnoaccel") && !checkKernelArgument("-crnogcn2crumb") && t >= 10)
+			gcn2Breadcrumb(t, now);
 		if (strcmp(now, last) || t % 15 == 0) {
 			strlcpy(last, now, sizeof(last));
 			iGPU->setProperty("UnifiedRed,tree", now);
@@ -5426,13 +5433,18 @@ static uint32_t wrapAccelRegRead(void *that, uint32_t dword) {
 	uint32_t byte = dword << 2;
 	if (!dce8Translate(byte, false, 0, 0))
 		return 0;
-	return gcn2MemSizeRead(byte >> 2, org(that, byte >> 2));
+	return gcn2ValueRead(dword, gcn2MemSizeRead(byte >> 2, org(that, byte >> 2)));
 }
 
 static void wrapAccelRegWrite(void *that, uint32_t dword, uint32_t value) {
 	auto org = FunctionCast(wrapAccelRegWrite, orgAccelRegWrite);
 	if (!accelRegMap)
 		return org(that, dword, value);
+	if (Dce8Map::writeDropped(dword)) {
+		__atomic_fetch_add(&dce8McWritesDropped, 1, __ATOMIC_RELAXED);
+		return;
+	}
+	value = gcn2ValueWrite(dword, value);
 	uint32_t byte = dword << 2;
 	if (!dce8Translate(byte, true, value, 0))
 		return;
@@ -8631,6 +8643,71 @@ static bool ihTongaRead(uint32_t dword, uint32_t &value) {
 	return true;
 }
 
+// Registers at the same offset whose fields moved between GFX 8 / GMC 8.1 / OSS 3.0 and GFX 7 / GMC 7.1 / OSS 2.0
+// (Linux sh_mask headers; the generator's report and scripts' field audit list them). Apple writes Polaris's layout:
+//  CP_RBn_CNTL         VI MTYPE 16:15, BUF_SWAP 18:17, CACHE_POLICY 24 -> CIK BUF_SWAP 17:16, CACHE_POLICY 25:24
+//                      (VI's MTYPE bits would land on CIK's BUF_SWAP: the CP would fetch the ring byte-swapped)
+//  CP_HQD_PQ_CONTROL   VI MTYPE 16:15, ENDIAN_SWAP 18:17, CACHE_POLICY 24, SLOT_BASED_WPTR 26:25
+//                      -> CIK ENDIAN_SWAP 17:16, CACHE_POLICY 25:24
+//  CP_HQD_IB_CONTROL   VI IB_CACHE_POLICY 24, MTYPE 28:27 -> CIK IB_CACHE_POLICY 25:24
+//  SH_MEM_CONFIG       VI ADDRESS_MODE 1:0, PRIVATE_ATC 2, ALIGNMENT_MODE 4:3, DEFAULT_MTYPE 7:5, APE1_MTYPE 10:8
+//                      -> CIK PTR32 0, PRIVATE_ATC 1, ALIGNMENT_MODE 3:2, DEFAULT_MTYPE 6:4, APE1_MTYPE 9:7 (the MTYPE
+//                      and alignment encodings are the same numbers on both: UC/NONCACHED 3, UNALIGNED 3)
+//  VM_CONTEXTn_CNTL    VI EXECUTE_PROTECTION_FAULT_* 23:21 are CIK's PRIVILEGED_PROTECTION_FAULT_*: cleared
+//  SDMAn_CNTL          VI ATC_L1_ENABLE 1 is CIK's SEM_INCOMPLETE_INT_ENABLE; MIDCMD_PREEMPT 5, MIDCMD_WORLDSWITCH 17,
+//                      IB_PREEMPT_INT 30 don't exist: cleared
+//  CP_EOP_DONE_EVENT_CNTL VI MTYPE 28:27 overlaps CIK's EOP_VOLATILE 27: cleared
+// Reads of the first four come back in Polaris's layout.
+static uint32_t gcn2ValueFixes;
+
+static uint32_t gcn2ValueWrite(uint32_t dword, uint32_t v) {
+	uint32_t out = v;
+	switch (dword) {
+		case 0x3041: case 0x3061: case 0x3066:  // CP_RB0/1/2_CNTL
+			out = (v & 0x88F03F3F) | (((v >> 17) & 3) << 16) | (((v >> 24) & 1) << 24);
+			break;
+		case 0x3256:  // CP_HQD_PQ_CONTROL
+			out = (v & 0xF8B03F3F) | (((v >> 17) & 3) << 16) | (((v >> 24) & 1) << 24);
+			break;
+		case 0x325A:  // CP_HQD_IB_CONTROL
+			out = (v & 0x80BFFFFF) | (((v >> 24) & 1) << 24);
+			break;
+		case 0x230D:  // SH_MEM_CONFIG
+			out = ((v & 3) == 1 ? 1 : 0) | (((v >> 2) & 1) << 1) | (((v >> 3) & 3) << 2) | (((v >> 5) & 7) << 4) |
+				(((v >> 8) & 7) << 7);
+			break;
+		case 0x504: case 0x505:  // VM_CONTEXT0/1_CNTL
+			out = v & ~0xE00000u;
+			break;
+		case 0x3404: case 0x3604:  // SDMA0/1_CNTL
+			out = v & ~0x40020022u;
+			break;
+		case 0xC0D5:  // CP_EOP_DONE_EVENT_CNTL
+			out = v & ~0x18000000u;
+			break;
+		default:
+			return v;
+	}
+	if (out != v)
+		__atomic_fetch_add(&gcn2ValueFixes, 1, __ATOMIC_RELAXED);
+	return out;
+}
+
+static uint32_t gcn2ValueRead(uint32_t dword, uint32_t c) {
+	switch (dword) {
+		case 0x3041: case 0x3061: case 0x3066:
+			return (c & 0x88F03F3F) | (((c >> 16) & 3) << 17) | (((c >> 24) & 1) << 24);
+		case 0x3256:
+			return (c & 0xF8B03F3F) | (((c >> 16) & 3) << 17) | (((c >> 24) & 1) << 24);
+		case 0x325A:
+			return (c & 0x80BFFFFF) | (((c >> 24) & 1) << 24);
+		case 0x230D:
+			return (c & 1) | (((c >> 1) & 1) << 2) | (((c >> 2) & 3) << 3) | (((c >> 4) & 7) << 5) | (((c >> 7) & 7) << 8);
+		default:
+			return c;
+	}
+}
+
 // readReg32 reads through hwReadReg32 (vtable +0x160), so with -crreglogall each such read shows twice; the inner one
 // is marked "/0x1".
 uint32_t CRDriver::wrapHwRead32(void *that, uint32_t offset) {
@@ -8682,8 +8759,8 @@ void CRDriver::wrapWrite8(void *that, uint32_t offset, uint32_t value) {
 uint32_t CRDriver::wrapRegRead32(void *that, uint32_t offset) {
 	if (dce8Remap) {
 		auto ra = reinterpret_cast<mach_vm_address_t>(__builtin_return_address(0));
-		uint32_t ih;
-		if (!fromAtom(ra) && ihTongaRead(offset >> 2, ih))
+		uint32_t ih, vi = offset >> 2;
+		if (!fromAtom(ra) && ihTongaRead(vi, ih))
 			return ih;
 		if (!dce8Translate(offset, false, 0, ra))
 			return 0;
@@ -8691,7 +8768,7 @@ uint32_t CRDriver::wrapRegRead32(void *that, uint32_t offset) {
 		if (flags & RegBlocked)
 			return 0;
 		uint32_t value = FunctionCast(wrapRegRead32, callback->orgRegRead32)(that, offset);
-		return regReadDone(flags, fromAtom(ra) ? value : gcn2MemSizeRead(offset >> 2, value));
+		return regReadDone(flags, fromAtom(ra) ? value : gcn2ValueRead(vi, gcn2MemSizeRead(offset >> 2, value)));
 	}
 	int flags = regAccess(RegRead, offset, 0, 0);
 	if (flags & RegBlocked)
@@ -8711,6 +8788,13 @@ void CRDriver::wrapRegWrite32(void *that, uint32_t offset, uint32_t value) {
 		auto ra = reinterpret_cast<mach_vm_address_t>(__builtin_return_address(0));
 		if (!fromAtom(ra) && ihTongaWrite(offset >> 2, value))
 			return;
+		if (!fromAtom(ra)) {
+			if (Dce8Map::writeDropped(offset >> 2)) {
+				__atomic_fetch_add(&dce8McWritesDropped, 1, __ATOMIC_RELAXED);
+				return;
+			}
+			value = gcn2ValueWrite(offset >> 2, value);
+		}
 		if (!dce8Translate(offset, true, value, ra))
 			return;
 		if (!fromAtom(ra))
@@ -15170,9 +15254,10 @@ const char *CRDriver::composeReportGcn2(uint32_t t, const char *tree) {
 			VBIOS::ImageProperty, image ? image->getLength() : 0,
 			dev && dev->getLength() >= 2 ? *static_cast<const uint16_t *>(dev->getBytesNoCopy()) : 0);
 	}
-	add("vbios calls %u, %u failed; dce8 map %s: moved %u, dropped %u (%u writes), vbios passed %u, lb fixes %u; "
-		"first dropped (w = write):", atomGcn2Calls, atomGcn2Failed, dce8Remap ? "on" : "off", dce8Moved, dce8Dropped,
-		dce8DroppedWrites, dce8Atom, dce8LbFixes);
+	add("vbios calls %u, %u failed; dce8 map %s: moved %u, dropped %u (%u writes), vbios passed %u, lb fixes %u, "
+		"MC writes dropped %u, values rewritten %u; first dropped (w = write):", atomGcn2Calls, atomGcn2Failed,
+		dce8Remap ? "on" : "off", dce8Moved, dce8Dropped, dce8DroppedWrites, dce8Atom, dce8LbFixes, dce8McWritesDropped,
+		gcn2ValueFixes);
 	for (uint32_t i = 0; i < dce8DroppedFirstCount && i < arrsize(dce8DroppedFirst); i++)
 		add(" %x%s", dce8DroppedFirst[i] & 0xFFFF, (dce8DroppedFirst[i] >> 31) ? "w" : "");
 	add("\nreserve %u MB at %llx (memsize views %u), ih tonga writes %u ring %s at %llx, ih calls %u rptr writes %u; "
@@ -15192,4 +15277,89 @@ const char *CRDriver::composeReportGcn2(uint32_t t, const char *tree) {
 	add("\ndisk log: %s, %u writes, %u errors (last %d)\n", diskLogPath[0] ? diskLogPath : "not started", diskLogWrites,
 		diskLogErrors, diskLogLastError);
 	return report;
+}
+
+// GCN 2 log channel without a keyboard: the accelerated boot keeps a compact status in NVRAM (UR-gcn2, Apple's GUID),
+// and the next boot prints it on the verbose console and pauses so it can be photographed (gcn2PrintPreviousBoot).
+// Written every 5 s while it changes, at most 120 times, only with acceleration requested. -crnogcn2crumb disables.
+static uint32_t gcn2CrumbWrites;
+
+static void gcn2Breadcrumb(uint32_t t, const char *tree) {
+	static IORegistryEntry *options;
+	static char text[1400], last[1400];
+	static uint32_t lastT;
+	if (gcn2CrumbWrites >= 120 || (gcn2CrumbWrites && t - lastT < 5) || !gpuMmio)
+		return;
+	if (!options && !(options = IORegistryEntry::fromPath("/options", gIODTPlane)))
+		return;
+	auto *m = gpuMmio;
+	auto rd = [m](uint32_t polaris) { return m[Dce8Map::translate(polaris) & 0xFFFF]; };
+	size_t len = 0;
+	auto add = [&](const char *fmt, ...) {
+		if (len + 1 >= sizeof(text))
+			return;
+		va_list va;
+		va_start(va, fmt);
+		int n = vsnprintf(text + len, sizeof(text) - len, fmt, va);
+		va_end(va);
+		if (n > 0)
+			len += static_cast<size_t>(n) < sizeof(text) - len ? static_cast<size_t>(n) : sizeof(text) - len - 1;
+	};
+	// Register values first (Polaris offsets read through the table): GRBM_STATUS/2, SRBM_STATUS, CP_RB0_RPTR/WPTR,
+	// CP_ME_CNTL, sDMA0/1 GFX_RB_RPTR/WPTR, SDMA0_STATUS_REG, IH_RB_RPTR/WPTR (CIK), MC_VM_FB_LOCATION, VM_CONTEXT0_CNTL,
+	// VM L2 protection fault status.
+	add("t=%u w=%u | grbm %x %x srbm %x | gfx %x/%x me %x | sdma %x/%x %x/%x st %x | ih %x/%x | fb %x vm0 %x fault %x/%x | ",
+		t, gcn2CrumbWrites, rd(0x2004), rd(0x2002), rd(0x394), rd(0x21C0), rd(0x3045), rd(0x21B6), rd(0x3483), rd(0x3484),
+		rd(0x3683), rd(0x3684), rd(0x340D), m[CikIh::RbCntl + 2], m[CikIh::RbCntl + 3], m[Reg::MC_VM_FB_LOCATION],
+		rd(0x504), rd(0x536), rd(0x538));
+	add("map %s/%s moved %u dropped %u mc %u vals %u ih %u/%u ring %s | cail %u/%u", dce8Remap ? "on" : "off",
+		accelRegMap ? "on" : "off", dce8Moved, dce8Dropped, dce8McWritesDropped, gcn2ValueFixes,
+		__atomic_load_n(&ihHandlerCalls, __ATOMIC_RELAXED), ihTongaWrites, ihMoveResult ? ihMoveResult : "-", cailWaits,
+		cailWaitFailures);
+	for (uint32_t i = 0; i < cailWaitFailures && i < 3; i++)
+		add(" [%x]&%x!=%x(%x)", cailWaitFails[i].reg, cailWaitFails[i].mask, cailWaitFails[i].value, cailWaitFails[i].read);
+	// The attach tree, one line per entry joined with ';' (accelerator, framebuffers, displays).
+	add(" | tree:");
+	for (const char *c = tree; c && *c && len + 2 < sizeof(text) - 400; c++)
+		if (*c == '\n')
+			add(";");
+		else if (*c != ' ' || (c > tree && c[-1] != ' '))
+			add("%c", *c);
+	size_t summary = strlen(traceSummary), room = sizeof(text) - len > 8 ? sizeof(text) - len - 8 : 0;
+	add(" | trace: %s", traceSummary + (summary > room ? summary - room : 0));
+	// Status lines differ in t only: write when something else changed.
+	const char *body = strchr(text, '|'), *lastBody = strchr(last, '|');
+	if (body && lastBody && !strcmp(body, lastBody))
+		return;
+	strlcpy(last, text, sizeof(last));
+	lastT = t;
+	auto *data = OSData::withBytes(text, static_cast<unsigned>(len));
+	if (!data)
+		return;
+	options->setProperty("UR-gcn2", data);
+	data->release();
+	options->setProperty("IONVRAM-FORCESYNCNOW-PROPERTY", "UR-gcn2");
+	options->setProperty("IONVRAM-SYNCNOW-PROPERTY", "UR-gcn2");
+	gcn2CrumbWrites++;
+}
+
+// At detection: the previous accelerated boot's status, printed in 90-character lines, then a 20 s pause (verbose
+// boots only). The variable stays until the next accelerated boot replaces it. -crnoprevreport skips this.
+static void gcn2PrintPreviousBoot() {
+	if (checkKernelArgument("-crnoprevreport") || !checkKernelArgument("-v"))
+		return;
+	auto *options = IORegistryEntry::fromPath("/options", gIODTPlane);
+	auto *data = options ? OSDynamicCast(OSData, options->getProperty("UR-gcn2")) : nullptr;
+	if (!data || !data->getLength()) {
+		OSSafeReleaseNULL(options);
+		return;
+	}
+	auto *text = static_cast<const char *>(data->getBytesNoCopy());
+	uint32_t length = data->getLength();
+	IOLog("UnifiedRed: ===== previous accelerated boot (UR-gcn2, %u bytes) =====\n", length);
+	for (uint32_t pos = 0; pos < length; pos += 90)
+		IOLog("UR| %.*s\n", static_cast<int>(length - pos < 90 ? length - pos : 90), text + pos);
+	IOLog("UnifiedRed: ===== end; pausing 20 s for a photo =====\n");
+	OSSafeReleaseNULL(options);
+	IOSleep(20000);
 }
