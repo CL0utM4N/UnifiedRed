@@ -4201,7 +4201,8 @@ static size_t gcn2DisplayState(ChipFamily family, char *buf, size_t size, bool r
 
 
 void CRDriver::gcn2Watch() {
-	// The previous accelerated boot's status, from this thread: the patcher callback at detection didn't pause.
+	// The previous accelerated boot's status. Pausing doesn't work (sleeping this thread doesn't hold the boot, and
+	// the console scrolls on), so it is printed at start and again every 15 s for 90 s.
 	gcn2PrintPreviousBoot();
 	static char now[1536], last[1536], display[1024], lastDisplay[1024];
 	diskLogOff = checkKernelArgument("-crnodisklog");
@@ -4212,6 +4213,8 @@ void CRDriver::gcn2Watch() {
 	for (uint32_t tick = 0, t = 0;; tick++, t = tick / 2) {
 		watcherBeat++;
 		mirrorKernelLog();
+		if (tick && tick % 30 == 0 && t <= 90)
+			gcn2PrintPreviousBoot();
 		if (!gpuMmio)
 			probeMMIO();
 		// Trace events from the wrappers (only with the Polaris spoof, once Apple's drivers run).
@@ -15396,8 +15399,7 @@ static void gcn2Breadcrumb(uint32_t t, const char *tree) {
 	gcn2CrumbWrites++;
 }
 
-// At detection: the previous accelerated boot's status, printed in 90-character lines, then a 20 s pause (verbose
-// boots only). The variable stays until the next accelerated boot replaces it. -crnoprevreport skips this.
+// The previous accelerated boot's status, printed in 90-character lines (verbose boots only). The variable stays until the next accelerated boot replaces it. -crnoprevreport skips this.
 static void gcn2PrintPreviousBoot() {
 	if (checkKernelArgument("-crnoprevreport") || !checkKernelArgument("-v"))
 		return;
@@ -15412,7 +15414,6 @@ static void gcn2PrintPreviousBoot() {
 	IOLog("UnifiedRed: ===== previous accelerated boot (UR-gcn2, %u bytes) =====\n", length);
 	for (uint32_t pos = 0; pos < length; pos += 90)
 		IOLog("UR| %.*s\n", static_cast<int>(length - pos < 90 ? length - pos : 90), text + pos);
-	IOLog("UnifiedRed: ===== end; pausing 20 s for a photo =====\n");
+	IOLog("UnifiedRed: ===== end (printed again every 15 s for 90 s) =====\n");
 	OSSafeReleaseNULL(options);
-	IOSleep(20000);
 }
