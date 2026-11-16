@@ -1559,7 +1559,6 @@ void CRDriver::processPatcher(KernelPatcher &patcher) {
 	// so the EFI keeps them off the iGPU and the watcher, which normally starts with AMD9500Controller, starts here:
 	// it gives the report (crpanicat) with the PCI info, carve-out, GB_ADDR_CONFIG and the VBIOS source.
 	if (isGcn2(family)) {
-		gcn2PrintPreviousBoot();
 		SYSLOG("cr", "%s: watcher starts at detection", familyName(family));
 		startWatcher();
 	}
@@ -4202,6 +4201,8 @@ static size_t gcn2DisplayState(ChipFamily family, char *buf, size_t size, bool r
 
 
 void CRDriver::gcn2Watch() {
+	// The previous accelerated boot's status, from this thread: the patcher callback at detection didn't pause.
+	gcn2PrintPreviousBoot();
 	static char now[1536], last[1536], display[1024], lastDisplay[1024];
 	diskLogOff = checkKernelArgument("-crnodisklog");
 	bool controllerRequested = checkKernelArgument("-crnoloadctl");
@@ -4969,6 +4970,33 @@ namespace {
 		{"_Stoney_UpdateMediumGrainClockGating", "Stoney_UpdateMediumGrainClockGating", InHWLibs, true, false, 0},
 		{"_Cail_Fiji_EnableLBPW", "Cail_Fiji_EnableLBPW", InHWLibs, true, false, 0},
 		{"_stoney_init_LBPW", "stoney_init_LBPW", InHWLibs, true, false, 0},
+		// GCN 2 (Kaveri, Kabini/Mullins): CAIL runs Bonaire's _BonaireAsicSetupTable with Spectre/Kalindi overrides.
+		// Every step, so a boot that stops (2026-11-16: the machine froze right after CAILQueryASICInfo) names it.
+		// bonaire_program_pcie_link_width is 11 bytes, too short to route.
+		{"_bonaire_update_register_golden_settings", "bonaire_golden_settings", InHWLibs, true, false, 0},
+		{"_bonaire_init_ucode_buffer", "bonaire_init_ucode_buffer", InHWLibs, true, false, 0},
+		{"_bonaire_init_ECC", "bonaire_init_ECC", InHWLibs, true, false, 0},
+		{"_bonaire_halt_rlc", "bonaire_halt_rlc", InHWLibs, true, false, 0},
+		{"_Cail_Bonaire_ResetRlc", "Cail_Bonaire_ResetRlc", InHWLibs, true, false, 0},
+		{"_bonaire_init_power_gating", "bonaire_init_power_gating", InHWLibs, true, false, 0},
+		{"_Cail_Spectre_InitializePowerGating", "Cail_Spectre_InitializePowerGating", InHWLibs, true, false, 0},
+		{"_bonaire_init_LBPW", "bonaire_init_LBPW", InHWLibs, true, false, 0},
+		{"_bonaire_init_clock_gating", "bonaire_init_clock_gating", InHWLibs, true, false, 0},
+		{"_bonaire_init_rlc", "bonaire_init_rlc", InHWLibs, true, false, 0},
+		{"_bonaire_unhalt_rlc", "bonaire_unhalt_rlc", InHWLibs, true, false, 0},
+		{"_Cail_Bonaire_InitNonsurfAperture", "Cail_Bonaire_InitNonsurfAperture", InHWLibs, true, false, 0},
+		{"_Cail_Bonaire_ProgramPcieGen3", "Cail_Bonaire_ProgramPcieGen3", InHWLibs, true, false, 0},
+		{"_bonaire_program_aspm", "bonaire_program_aspm", InHWLibs, true, false, 0},
+		{"_Bonaire_InitUvdClocks", "Bonaire_InitUvdClocks", InHWLibs, true, false, 0},
+		{"_Bonaire_InitVceClocks", "Bonaire_InitVceClocks", InHWLibs, true, false, 0},
+		{"_Bonaire_InitAcpClocks", "Bonaire_InitAcpClocks", InHWLibs, true, false, 0},
+		{"_Bonaire_InitSamuClocks", "Bonaire_InitSamuClocks", InHWLibs, true, false, 0},
+		{"_bonaire_init_enable_ats", "bonaire_init_enable_ats", InHWLibs, true, false, 0},
+		{"_Cail_Bonaire_LoadUcode", "Cail_Bonaire_LoadUcode", InHWLibs, true, false, 0},
+		{"_Cail_Spectre_InitCPJumpTable", "Cail_Spectre_InitCPJumpTable", InHWLibs, true, false, 0},
+		{"_Cail_Spectre_InitSaveRestoreBuffer", "Cail_Spectre_InitSaveRestoreBuffer", InHWLibs, true, false, 0},
+		{"_Spectre_PowerGatingControl", "Spectre_PowerGatingControl", InHWLibs, true, false, 0},
+		{"_Spectre_EnterRlcSafeMode", "Spectre_EnterRlcSafeMode", InHWLibs, true, false, 0},
 		{"_Cail_Tonga_MicroEngineControlCp", "Cail_Tonga_MicroEngineControlCp", InHWLibs, true, false, 0},
 		{"_Cail_Tonga_MicroEngineControlMec", "Cail_Tonga_MicroEngineControlMec", InHWLibs, true, false, 0},
 		{"_Cail_Tonga_MicroEngineControlSdma", "Cail_Tonga_MicroEngineControlSdma", InHWLibs, true, false, 0},
@@ -5164,7 +5192,7 @@ namespace {
 
 #define CR_WRAP(n) reinterpret_cast<mach_vm_address_t>(wrapStage<n>)
 	void routeStages(KernelPatcher &patcher, size_t index, mach_vm_address_t slide, size_t size, TraceKext kext) {
-		static_assert(arrsize(stages) == 197, "one wrapper per stage");
+		static_assert(arrsize(stages) == 221, "one wrapper per stage");
 		mach_vm_address_t wrappers[] {
 			CR_WRAP(0), CR_WRAP(1), CR_WRAP(2), CR_WRAP(3), CR_WRAP(4), CR_WRAP(5), CR_WRAP(6), CR_WRAP(7),
 			CR_WRAP(8), CR_WRAP(9), CR_WRAP(10), CR_WRAP(11), CR_WRAP(12), CR_WRAP(13), CR_WRAP(14), CR_WRAP(15),
@@ -5191,7 +5219,10 @@ namespace {
 			CR_WRAP(169), CR_WRAP(170), CR_WRAP(171), CR_WRAP(172), CR_WRAP(173), CR_WRAP(174), CR_WRAP(175), CR_WRAP(176),
 			CR_WRAP(177), CR_WRAP(178), CR_WRAP(179), CR_WRAP(180), CR_WRAP(181), CR_WRAP(182), CR_WRAP(183), CR_WRAP(184),
 			CR_WRAP(185), CR_WRAP(186), CR_WRAP(187), CR_WRAP(188), CR_WRAP(189), CR_WRAP(190), CR_WRAP(191), CR_WRAP(192),
-			CR_WRAP(193), CR_WRAP(194), CR_WRAP(195), CR_WRAP(196),
+			CR_WRAP(193), CR_WRAP(194), CR_WRAP(195), CR_WRAP(196), CR_WRAP(197), CR_WRAP(198), CR_WRAP(199), CR_WRAP(200),
+			CR_WRAP(201), CR_WRAP(202), CR_WRAP(203), CR_WRAP(204), CR_WRAP(205), CR_WRAP(206), CR_WRAP(207), CR_WRAP(208),
+			CR_WRAP(209), CR_WRAP(210), CR_WRAP(211), CR_WRAP(212), CR_WRAP(213), CR_WRAP(214), CR_WRAP(215), CR_WRAP(216),
+			CR_WRAP(217), CR_WRAP(218), CR_WRAP(219), CR_WRAP(220),
 		};
 		for (size_t i = 0; i < arrsize(stages); i++) {
 			if (stages[i].kext != kext)
@@ -7848,6 +7879,13 @@ static void pgOff() {
 		mmio[0xEC43] = 0x8000;  // RLC_PG_CNTL: CP_PG_DISABLE, nothing enabled
 }
 
+static uint32_t gcn2PgBlocked;
+
+static uint64_t wrapGcn2PgOff(void *, uint64_t) {
+	gcn2PgBlocked++;
+	return 0;
+}
+
 static uint64_t wrapCailStoneyEnablePg(void *) {
 	pgOff();
 	traceNote("pg=off ");
@@ -8123,9 +8161,23 @@ void CRDriver::traceKext(KernelPatcher &patcher, size_t index, mach_vm_address_t
 			for (size_t i = 0; i < arrsize(pg); i++)
 				routeHwlibs(patcher, index, pg[i], slide, size, pgHooks[i]);
 		}
-		if ((family == ChipFamily::Stoney || family == ChipFamily::Carrizo) && !checkKernelArgument("-crats")) {
+		if ((family == ChipFamily::Stoney || family == ChipFamily::Carrizo || isGcn2(family)) &&
+			!checkKernelArgument("-crats")) {
 			KernelPatcher::RouteRequest ats {"_Cail_Spectre_EnableAts", wrapCailEnableAts, orgCailEnableAts};
 			routeHwlibs(patcher, index, ats, slide, size, HookAts);
+		}
+		// GCN 2: Kaveri's GFX, CP and GDS power gating stay off (Stoney's reasons, see wrapCailStoneyEnablePg; and the
+		// RLC/SMU handshake behind them is PowerPlay's kv_dpm, which the Dummy back end doesn't do). The set-up itself,
+		// Cail_Spectre_InitializePowerGating (CSIB, save/restore list), still runs. -crgating keeps CAIL's.
+		if (isGcn2(family) && !checkKernelArgument("-crgating")) {
+			KernelPatcher::RouteRequest pg[] {
+				{"_Spectre_UpdateGfxPowerGating", wrapGcn2PgOff},
+				{"_Spectre_EnableCpPowerGating", wrapGcn2PgOff},
+				{"_Spectre_EnableGDSPowerGating", wrapGcn2PgOff},
+			};
+			static const HwlibsHook pgHooks[] {HookPgGfx, HookPgCp, HookPgEnable};
+			for (size_t i = 0; i < arrsize(pg); i++)
+				routeHwlibs(patcher, index, pg[i], slide, size, pgHooks[i]);
 		}
 		if ((family == ChipFamily::Stoney || family == ChipFamily::Carrizo) && !checkKernelArgument("-crnodirectucode")) {
 			// The flags word store, and the RLC loader's test of the flag (test byte [rbx+0x6F2], 0x20). Catalina's CAIL
@@ -15327,9 +15379,10 @@ static void gcn2Breadcrumb(uint32_t t, const char *tree) {
 			add("%c", *c);
 	size_t summary = strlen(traceSummary), room = sizeof(text) - len > 8 ? sizeof(text) - len - 8 : 0;
 	add(" | trace: %s", traceSummary + (summary > room ? summary - room : 0));
-	// Status lines differ in t only: write when something else changed.
+	// Status lines differ in t only: write when something else changed, or every 30 s as a heartbeat (so a frozen
+	// machine, whose last write is old, can be told from a stuck start-up, whose t keeps going).
 	const char *body = strchr(text, '|'), *lastBody = strchr(last, '|');
-	if (body && lastBody && !strcmp(body, lastBody))
+	if (body && lastBody && !strcmp(body, lastBody) && t - lastT < 30)
 		return;
 	strlcpy(last, text, sizeof(last));
 	lastT = t;
