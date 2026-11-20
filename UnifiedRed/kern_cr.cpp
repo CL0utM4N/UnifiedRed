@@ -284,6 +284,7 @@ static uint32_t gcn2ValueRead(uint32_t dword, uint32_t c);
 static void gcn2Breadcrumb(uint32_t t, const char *tree);
 static void gcn2PrintPreviousBoot();
 static void gcn2StageCrumb(const char *name, bool exit, uint32_t ret);
+static void gcn2MmSlots(void *hardware, void **saved, bool restore);
 // Tonga's IH_RB_CNTL / IH_CNTL as Apple last wrote them (see ihTongaWrite).
 static uint32_t ihTongaRbCntl, ihTongaCntl, ihTongaWrites;
 // A small leaf function's end: the first "pop rbp; ret" (these accessors keep frame pointers), else 0x80 bytes.
@@ -5195,7 +5196,16 @@ namespace {
 						gpuMmio[0x13B]);
 			}
 		}
+		// GCN 2: the multimedia engines (UVD, VCE, SAMU) stay out of the accelerator's memory set-up, as they stay out
+		// of its power-up (wrapPowerUpHWEngines): 629d407's boot froze inside AMDHardware::allocateMemoryResources, whose
+		// engine loop skips empty slots. -crmm keeps them.
+		void *mmSaved[3] {};
+		bool mmSkip = gcn2Gpu && a && !strcmp(stages[N].name, "hw.allocateMemoryResources") && !checkKernelArgument("-crmm");
+		if (mmSkip)
+			gcn2MmSlots(a, mmSaved, false);
 		auto ret = FunctionCast(wrapStage<N>, stages[N].org)(a, b, c, d, e, f);
+		if (mmSkip)
+			gcn2MmSlots(a, mmSaved, true);
 		if (!strcmp(stages[N].name, "initializeProjectDependentResources"))
 			controllerReady = true;
 		if (gcn2Gpu && gcn2CrumbStage(stages[N].kext, stages[N].name))
@@ -5541,6 +5551,13 @@ void CRDriver::patchAccelerator(KernelPatcher &patcher, size_t index, mach_vm_ad
 		accelRegMap = read && write;
 		traceNote("accelmap=%s ", accelRegMap ? "on" : "FAILED");
 	}
+	// GCN 2: no multimedia power-up either (wrapPowerUpHWEngines; Kaveri's SMU keeps UVD, VCE and SAMU gated).
+	if (isGcn2(family) && getKernelVersion() != KernelVersion::Catalina) {
+		static const char *const powerUpChecksGcn2[] {"4b8bbcfeb0030000|498bbcdeb0030000", nullptr};
+		route("__ZN26AMDRadeonX4000_AMDHardware16powerUpHWEnginesEv",
+			reinterpret_cast<mach_vm_address_t>(wrapPowerUpHWEngines), orgPowerUpHWEngines, powerUpChecksGcn2, 0x30,
+			"powerUpHWEngines");
+	}
 	// The 16-bank LDS interpolation fix, at submission (see wrapCommitIb).
 	interpFixOff = checkKernelArgument("-crnointerpfix") || family != ChipFamily::Stoney;
 	// Raising a shader's VGPR allocation is safe only when the submit hook sees every command buffer that binds it
@@ -5784,6 +5801,23 @@ bool CRDriver::wrapAllocateHWEngines(void *that) {
 // -crvideo (stage 1 of docs/VIDEO.md): first have the SMU power UVD and VCE up (UVDPowerON / VCEPowerON, as Linux
 // smu8_dpm_powergate_uvd/vce do), then let Apple power those two up; SAMU stays skipped.
 static void smuVideoPowerOn();
+
+static uint32_t gcn2MmEmptied;
+
+// Empty (and later restore) the AMDHardware's UVD, VCE and SAMU engine slots; saved holds 3 entries.
+static void gcn2MmSlots(void *hardware, void **saved, bool restore) {
+	for (size_t i = 0; i < arrsize(hwMmSlots); i++) {
+		auto &engine = *reinterpret_cast<void **>(static_cast<uint8_t *>(hardware) + hwMmSlots[i]);
+		if (restore) {
+			engine = saved[i];
+		} else {
+			saved[i] = engine;
+			if (engine)
+				gcn2MmEmptied++;
+			engine = nullptr;
+		}
+	}
+}
 
 static bool wrapPowerUpHWEngines(void *that) {
 	auto &multimedia = hwMmSlots;
@@ -15388,6 +15422,7 @@ static void gcn2Breadcrumb(uint32_t t, const char *tree) {
 		t, gcn2CrumbWrites, rd(0x2004), rd(0x2002), rd(0x394), rd(0x21C0), rd(0x3045), rd(0x21B6), rd(0x3483), rd(0x3484),
 		rd(0x3683), rd(0x3684), rd(0x340D), m[CikIh::RbCntl + 2], m[CikIh::RbCntl + 3], m[Reg::MC_VM_FB_LOCATION],
 		rd(0x504), rd(0x536), rd(0x538));
+	add("mm emptied %u | ", gcn2MmEmptied);
 	add("map %s/%s moved %u dropped %u mc %u vals %u ih %u/%u ring %s | cail %u/%u", dce8Remap ? "on" : "off",
 		accelRegMap ? "on" : "off", dce8Moved, dce8Dropped, dce8McWritesDropped, gcn2ValueFixes,
 		__atomic_load_n(&ihHandlerCalls, __ATOMIC_RELAXED), ihTongaWrites, ihMoveResult ? ihMoveResult : "-", cailWaits,
