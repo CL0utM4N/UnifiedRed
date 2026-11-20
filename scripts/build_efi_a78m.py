@@ -12,7 +12,9 @@ Build an OpenCore EFI for the MSI A78M-E35 V2 (A6-7400K, Kaveri) GCN 2 test desk
                   own DCE 8 display controller, drives the display; -crnoaccel unless --accel
     --fchxhcifix  github.com/CL0utM4N/FCHXHCIFix, its IOPCIPrimaryMatch extended to this board's xHCI (1022:7814)
     --cpu         the APU in the socket (default a6-7400k): sets the core count AMD_Vanilla patches in. A8-7680
-                  is a desktop Carrizo (4 Excavator cores, GCN 3 R7): UnifiedRed's Carrizo path, no --spoof/--bonaire
+                  is a desktop Carrizo (4 Excavator cores, GCN 3 R7): AVX2 (no CryptexFixup), Apple's HfsPlus.efi
+                  (downloads/HfsPlus.efi), and UnifiedRed's Carrizo path: --spoof (Polaris 11, as on the D509BA), not
+                  --bonaire
     --debugoc     OpenCore's DEBUG binaries (unpacked/OpenCore-<ver>-DEBUG/); --oclog writes OpenCore's log to the stick
 
 <work dir> must contain:
@@ -23,6 +25,7 @@ Build an OpenCore EFI for the MSI A78M-E35 V2 (A6-7400K, Kaveri) GCN 2 test desk
     unpacked/FCHXHCIFix/                    (--fchxhcifix) FCHXHCIFix.kext
     downloads/AMD_Vanilla-patches.plist     github.com/AMD-OSX/AMD_Vanilla patches.plist
     downloads/HfsPlusLegacy.efi             github.com/acidanthera/OcBinaryData Drivers/HfsPlusLegacy.efi (no RDRAND)
+    downloads/HfsPlus.efi                   (--cpu=a8-7680) the same repository's Drivers/HfsPlus.efi
     acpi/SSDT-EC-USBX-LAPTOP.aml            compiled from docs/opencore/SSDT-EC-USBX-LAPTOP.dsl (iasl)
     acpi/SSDT-XOSI-A78M.aml                 compiled from docs/gcn2/opencore/SSDT-XOSI-A78M.dsl (iasl)
     recovery/com.apple.recovery.boot/       (optional) Sequoia Recovery from OpenCore's macrecovery.py
@@ -53,7 +56,12 @@ import sys
 import uuid
 from pathlib import Path
 
-CPU_CORES = {"a6-7400k": 2, "a8-7680": 4}  # Steamroller cores per APU; --cpu picks one
+# Per APU (--cpu): cores for AMD_Vanilla, whether it lacks AVX2 (CryptexFixup) and RDRAND (HfsPlusLegacy.efi), and
+# whether its graphics are GCN 2 (Kaveri, --bonaire allowed) or GCN 3 (Carrizo, the D509BA's Polaris spoof).
+CPUS = {
+    "a6-7400k": {"cores": 2, "avx2": False, "rdrand": False, "gcn2": True},   # Kaveri, Steamroller
+    "a8-7680": {"cores": 4, "avx2": True, "rdrand": True, "gcn2": False},     # desktop Carrizo, Excavator
+}
 CORE_COUNT = 2                      # set from --cpu in main()
 SMBIOS_MODEL = "iMac19,1"           # Sequoia-supported, Polaris graphics. Not MacPro6,1/7,1 or iMacPro1,1:
 # AppleIntelMCEReporter matches those board-ids and panics on AMD CPUs (D509BA, 2026-10-09).
@@ -73,7 +81,7 @@ KEXTS = [  # (bundle path inside its release folder, executable, comment, MinKer
 UNIFIEDRED_KEXT = ("UnifiedRed/UnifiedRed.kext", "UnifiedRed", "UnifiedRed (Lilu plugin, iGPU)", "")
 FCHXHCIFIX_KEXT = ("FCHXHCIFix/FCHXHCIFix.kext", "FCHXHCIFix", "USB: service the FCH xHCI if its interrupts are lost", "")
 
-DRIVERS = ["OpenRuntime.efi", "HfsPlusLegacy.efi", "ResetNvramEntry.efi"]
+DRIVERS = ["OpenRuntime.efi", "HfsPlusLegacy.efi", "ResetNvramEntry.efi"]  # HfsPlus.efi instead with RDRAND (main)
 
 SSDTS = {  # compiled from docs/opencore or docs/gcn2/opencore/<name>.dsl into <work dir>/acpi/
     "SSDT-EC-USBX-LAPTOP.aml": "Fake EC + USBX (no real EC on this board; EC under SBRG)",
@@ -81,7 +89,8 @@ SSDTS = {  # compiled from docs/opencore or docs/gcn2/opencore/<name>.dsl into <
 }
 
 # Polaris 11 (Baffin): in the IOPCIMatch lists of AMD9500Controller, AMDRadeonX4000 and HWServices. CAIL reads the
-# real device ID (0x1315) from config space and takes its Spectre (Kaveri) path (docs/OLDER_APUS.md).
+# real device ID (0x1315) from config space and takes its Spectre (Kaveri) path (docs/OLDER_APUS.md). A Carrizo (0x9874)
+# takes its Carrizo path, as the D509BA's Stoney does.
 SPOOF_DEVICE_ID = bytes.fromhex("EF670000")
 BONAIRE_DEVICE_ID = bytes.fromhex("5C660000")
 IGPU = "PciRoot(0x0)/Pci(0x1,0x0)"
@@ -147,11 +156,18 @@ def main():
         die("--spoof/--bonaire need --unifiedred (it supplies the VBIOS Apple's drivers need)")
     if len(args) != 1:
         sys.exit(__doc__)
-    global CORE_COUNT
+    global CORE_COUNT, DRIVERS, KEXTS
     cpu = next((a[len("--cpu="):].lower() for a in opts if a.startswith("--cpu=")), "a6-7400k")
-    if cpu not in CPU_CORES:
-        die(f"--cpu must be one of {', '.join(CPU_CORES)}")
-    CORE_COUNT = CPU_CORES[cpu]
+    if cpu not in CPUS:
+        die(f"--cpu must be one of {', '.join(CPUS)}")
+    prof = CPUS[cpu]
+    CORE_COUNT = prof["cores"]
+    if with_bonaire and not prof["gcn2"]:
+        die(f"--bonaire is for GCN 2 (Kaveri); {cpu} is GCN 3 Carrizo: use --spoof")
+    if prof["rdrand"]:
+        DRIVERS = ["HfsPlus.efi" if d == "HfsPlusLegacy.efi" else d for d in DRIVERS]
+    if prof["avx2"]:
+        KEXTS = [k for k in KEXTS if k[1] != "CryptexFixup"]
     work = Path(args[0]).resolve()
     unpacked = work / "unpacked"
     oc = one(unpacked, "OpenCore-*-RELEASE")

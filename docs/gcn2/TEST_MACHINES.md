@@ -173,3 +173,11 @@ alone. BIOS: IOMMU off, Secure Boot off, CSM off. Install from a **USB 2.0 port*
   takes over the display: picture, first try.
 - Getting logs off the machine is the open problem: no keyboard in the installer's Terminal, `dmpstore` to the USB
   stick freezes, and a panic restarts instead of staying on screen.
+
+### 2026-11-21: A8-7680 (desktop Carrizo) in the same board
+The A6-7400K was swapped for an **A8-7680**, a Carrizo die on FM2+ (4 Excavator cores, Radeon R7, GCN 3), so this board
+now tests UnifiedRed's Carrizo path, not GCN 2. Excavator has AVX2 and RDRAND, so it needs no CryptexFixup and uses
+Apple's `HfsPlus.efi`, like the D509BA. The Monterey 12.7.6 install on the disk stays. EFI:
+`python scripts/build_efi_a78m.py "<A8-7680 folder>/Support files/efi-build" --cpu=a8-7680 --unifiedred --spoof
+[--accel] --nopanicat --fchxhcifix` (`--bonaire` is refused: it is GCN 2 only). Built from 778c4c5:
+`usb-display` (`-crnoaccel`) and `usb-accel`, in `CarrizoRed-RE/EFI/MSI A78M-E35 V2 (A8-7680)/Support files/efi-build/`.
