@@ -3,7 +3,7 @@
 Build an OpenCore EFI for the MSI A78M-E35 V2 (A6-7400K, Kaveri) GCN 2 test desktop, macOS Sequoia.
 
     python scripts/build_efi_a78m.py <work dir> [--unifiedred [--nopanicat] [--spoof|--bonaire [--accel]]] [--fchxhcifix]
-                                                [--args="..."] [--oclog] [--debugoc]
+                                                [--cpu=a6-7400k|a8-7680] [--args="..."] [--oclog] [--debugoc]
 
     --unifiedred  add UnifiedRed (Debug build) with -crdbg and crpanicat=60, the deliberate report panic
     --nopanicat   with --unifiedred: no crpanicat=60
@@ -11,6 +11,8 @@ Build an OpenCore EFI for the MSI A78M-E35 V2 (A6-7400K, Kaveri) GCN 2 test desk
     --bonaire     with --unifiedred, Monterey and older: device-id 0x665C (Bonaire, R7 260X) so AMD8000Controller, Apple's
                   own DCE 8 display controller, drives the display; -crnoaccel unless --accel
     --fchxhcifix  github.com/CL0utM4N/FCHXHCIFix, its IOPCIPrimaryMatch extended to this board's xHCI (1022:7814)
+    --cpu         the APU in the socket (default a6-7400k): sets the core count AMD_Vanilla patches in. A8-7680
+                  is a desktop Carrizo (4 Excavator cores, GCN 3 R7): UnifiedRed's Carrizo path, no --spoof/--bonaire
     --debugoc     OpenCore's DEBUG binaries (unpacked/OpenCore-<ver>-DEBUG/); --oclog writes OpenCore's log to the stick
 
 <work dir> must contain:
@@ -51,7 +53,8 @@ import sys
 import uuid
 from pathlib import Path
 
-CORE_COUNT = 2                      # A6-7400K: 2 Steamroller cores
+CPU_CORES = {"a6-7400k": 2, "a8-7680": 4}  # Steamroller cores per APU; --cpu picks one
+CORE_COUNT = 2                      # set from --cpu in main()
 SMBIOS_MODEL = "iMac19,1"           # Sequoia-supported, Polaris graphics. Not MacPro6,1/7,1 or iMacPro1,1:
 # AppleIntelMCEReporter matches those board-ids and panics on AMD CPUs (D509BA, 2026-10-09).
 BOOT_ARGS = "-v keepsyms=1 debug=0x100 npci=0x3000 msgbuf=1048576 revpatch=sbvm,cpuname"
@@ -144,6 +147,11 @@ def main():
         die("--spoof/--bonaire need --unifiedred (it supplies the VBIOS Apple's drivers need)")
     if len(args) != 1:
         sys.exit(__doc__)
+    global CORE_COUNT
+    cpu = next((a[len("--cpu="):].lower() for a in opts if a.startswith("--cpu=")), "a6-7400k")
+    if cpu not in CPU_CORES:
+        die(f"--cpu must be one of {', '.join(CPU_CORES)}")
+    CORE_COUNT = CPU_CORES[cpu]
     work = Path(args[0]).resolve()
     unpacked = work / "unpacked"
     oc = one(unpacked, "OpenCore-*-RELEASE")
