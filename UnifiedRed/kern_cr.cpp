@@ -5070,6 +5070,20 @@ namespace {
 	// Six integer/pointer arguments cover every traced function. Events go to the ring (see traceEvent); the watcher
 	// prints them, and panics naming the function if a call hasn't returned after 10 s. "sync" stages also print
 	// directly and pause, because an instant whole-machine hang leaves the watcher no chance.
+	// GCN 2 start-up record (gcn2StageCrumb): CAIL/HWServices stages, and the accelerator's start-up ones by name
+	// (never the user-client or per-frame paths, which may run with locks held).
+	inline bool gcn2CrumbStage(TraceKext kext, const char *name) {
+		if (kext == InHWLibs || kext == InHWServices)
+			return true;
+		if (kext != InAccel || !name)
+			return false;
+		static const char *const prefixes[] {"accel.", "hw.", "hws.", "pm4.", "sdma.", "chan."};
+		for (auto *prefix : prefixes)
+			if (!strncmp(name, prefix, strlen(prefix)))
+				return true;
+		return false;
+	}
+
 	template <size_t N>
 	uint64_t wrapStage(void *a, void *b, void *c, void *d, void *e, void *f) {
 		static_assert(N < MaxTraceStages, "too many traced stages");
@@ -5087,7 +5101,7 @@ namespace {
 			case 5: arg = static_cast<uint32_t>(ac); break;
 		}
 		stageLastArg[N] = arg;
-		if (gcn2Gpu && (stages[N].kext == InHWLibs || stages[N].kext == InHWServices))
+		if (gcn2Gpu && gcn2CrumbStage(stages[N].kext, stages[N].name))
 			gcn2StageCrumb(stages[N].name, false, 0);
 		if (!strcmp(stages[N].name, "uc.dpPerform")) {
 			flipPipe = a;
@@ -5184,7 +5198,7 @@ namespace {
 		auto ret = FunctionCast(wrapStage<N>, stages[N].org)(a, b, c, d, e, f);
 		if (!strcmp(stages[N].name, "initializeProjectDependentResources"))
 			controllerReady = true;
-		if (gcn2Gpu && (stages[N].kext == InHWLibs || stages[N].kext == InHWServices))
+		if (gcn2Gpu && gcn2CrumbStage(stages[N].kext, stages[N].name))
 			gcn2StageCrumb(stages[N].name, true, static_cast<uint32_t>(ret));
 		traceEvent(stages[N].name, true, static_cast<uint32_t>(ret));
 		// Mode 5: d points at a status buffer the call fills (DP training: per-lane status read from the DPCD).
@@ -8989,6 +9003,8 @@ void CRDriver::wrapIhSetHardwareEnabled(void *that, bool enable) {
 	// GCN 2: the CIK IH is reached through the translation, with ihTongaWrite moving the enable bits to IH_CNTL.
 	bool gcn2 = isGcn2(callback->family);
 	bool off = enable && checkKernelArgument("-crnoih");
+	if (gcn2)
+		gcn2StageCrumb(enable ? (off ? "IH enable (forced off)" : "IH enable") : "IH disable", false, 0);
 	ihEnableCalls++;
 	ihLastEnable = enable && !off;
 	ihManager = that;
@@ -15460,8 +15476,9 @@ static void gcn2StageCrumb(const char *name, bool exit, uint32_t ret) {
 	if (!options && !(options = IORegistryEntry::fromPath("/options", gIODTPlane)))
 		return;
 	static char text[700];
-	size_t len = static_cast<size_t>(snprintf(text, sizeof(text), "%llu ms #%u ENTER %s | before:", uptimeMs(), writes,
-		name));
+	size_t len = static_cast<size_t>(snprintf(text, sizeof(text), "%llu ms #%u ENTER %s | ih calls %u writes %u ring %s | before:",
+		uptimeMs(), writes, name, __atomic_load_n(&ihHandlerCalls, __ATOMIC_RELAXED), ihTongaWrites,
+		ihMoveResult ? ihMoveResult : "-"));
 	for (uint32_t i = head > arrsize(recent) ? head - arrsize(recent) : 0; i + 1 < head && len < sizeof(text); i++) {
 		auto &e = recent[i % arrsize(recent)];
 		len += static_cast<size_t>(snprintf(text + len, sizeof(text) - len, e.exit ? " %s=%x" : " >%s", e.name, e.ret));
