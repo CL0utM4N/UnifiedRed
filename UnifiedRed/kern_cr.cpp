@@ -3703,6 +3703,11 @@ static void startInterpFix();  // defined with the black box below
 // The interpolation fix's submit hook and its shared state (see wrapCommitIb).
 static IOLock *interpLock;
 static bool interpFixOff, interpHooked, interpBump, interpSubmit;
+// The VCE/UVD bridge reads page tables and command buffers through the carve-out mapping and the physmap, which used
+// to be on only with the interpolation fix (Stoney): on Carrizo (A8-7680, 2026-11-21) "GART table not mapped", VCE
+// ran on virtual addresses it can't use and the screen froze at Apple's restart. On with -crvce or -cruvd too.
+static bool videoMemAccess;
+static bool carveInit();
 static mach_vm_address_t orgCommitIb, orgCommitIbFiji;
 static uint64_t wrapCommitIb(void *channel, uint8_t *info);
 static uint64_t wrapCommitIbFiji(void *channel, uint8_t *info);
@@ -4514,6 +4519,10 @@ void CRDriver::watcherThread(void *arg, wait_result_t) {
 			fixRbPlus(gpuMmio, self->family == ChipFamily::Stoney);
 		if (smuLoadOk() && self->family == ChipFamily::Stoney)
 			startInterpFix();
+		// Without the interpolation fix's thread (not Stoney), map the carve-out for the video bridge here, outside any
+		// submission path (a mapping made inside one can deadlock: see the submit hook).
+		if (smuLoadOk() && videoMemAccess && !interpSubmit)
+			carveInit();
 		if (accelDeferred && controllerReady) {
 			accelDeferred = false;
 			accelRematches++;
@@ -5592,6 +5601,7 @@ void CRDriver::patchAccelerator(KernelPatcher &patcher, size_t index, mach_vm_ad
 	}
 	// The 16-bank LDS interpolation fix, at submission (see wrapCommitIb).
 	interpFixOff = checkKernelArgument("-crnointerpfix") || family != ChipFamily::Stoney;
+	videoMemAccess = checkKernelArgument("-crvideo") && (checkKernelArgument("-crvce") || checkKernelArgument("-cruvd"));
 	// Raising a shader's VGPR allocation is safe only when the submit hook sees every command buffer that binds it
 	// (else the shader runs with registers it doesn't own): the hook raises RSRC1_PS from an append-only table, even
 	// when it can't take the lock. -crnointerpbump disables raising.
@@ -10871,7 +10881,7 @@ static bool carveInit() {
 // nothing). Reads flush the lines first (the Metal driver writes through its own write-combined mapping); writes flush
 // after (the GPU may read system memory without snooping).
 static uint8_t *physmapPtr(uint64_t phys, uint32_t bytes) {
-	if (!interpSubmit || !physmapBaseVar || !physmapMaxVar)
+	if ((!interpSubmit && !videoMemAccess) || !physmapBaseVar || !physmapMaxVar)
 		return nullptr;
 	uint64_t base = *physmapBaseVar, max = *physmapMaxVar;
 	if (!base || base + phys + bytes > max || base + phys < base)
@@ -10892,7 +10902,7 @@ static inline bool inHook() {
 }
 
 static uint8_t *carvePtr(uint64_t phys, uint32_t bytes) {
-	if (!interpSubmit)
+	if (!interpSubmit && !videoMemAccess)
 		return nullptr;
 	if (!__atomic_load_n(&carveMap, __ATOMIC_ACQUIRE) && (inHook() || !carveInit()))
 		return nullptr;
