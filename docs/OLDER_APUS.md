@@ -375,6 +375,24 @@ must live in VRAM; `relocateFb` with DCE 8 pipe offsets; PowerPlay's Dummy back 
 fixes. Whether CAIL's Spectre caps (0x125, 0x53) pick direct microcode loading or a wait for the SMU is the first
 thing the CAIL wait log will show.
 
+**Accelerator, where it stands (2026-11-21, A6-7400K, Monterey, UnifiedRed 62e5e73; the disk logs, not the NVRAM
+records, which stop when the firmware's NVRAM fills).** There is no freeze: the machine runs for minutes.
+- CAIL's whole Kaveri start-up runs (`_BonaireAsicSetupTable` with Spectre overrides; ATS skipped), PowerPlay comes up
+  on the Dummy back end, `Cail_Bonaire_LoadUcode` writes the seven Kaveri images directly (no SMU loader needed), the
+  accelerator starts ("Accelerator successfully registered with controller") and `pm4.start` returns after 5 s.
+- **KIQ:** "Stamp Timeout for KIQ Submission!". The VI layer maps compute queues through a kernel interface queue
+  (`AMDVIKIQHWChannel`). Monterey's own CI layer has one too (`AMDCIKIQHWChannel`), so Kaveri's MEC firmware takes
+  KIQ packets; the formats differ in details (MAP_QUEUES dword 1 bit 16, the order of dwords 3-6, and VI's extra
+  SET_RESOURCES), as may the MQD layout (`AMDCIPM4Engine` vs `AMDVIPM4Engine::InitMapQueueMQD`). Sequoia and Tahoe
+  have only the VI classes, so UnifiedRed needs its own CI-style KIQ, modelled on Monterey's.
+- **No display:** the controller's `BaffinPowerPlayManager::initialize` sends a request to the accelerator
+  (`sendRequestToAccelerator` -> `callPlatformFunction`) that never returns, so the framebuffers never get connectors
+  (`conn=0x0`) and WindowServer has nothing to draw on: the black screen. Likely waiting on the GPU after the KIQ
+  failure.
+- "Memory reserved offset is out of available range" (x3): CAIL's VBIOS-reserved block at the top of the carve-out lies
+  in UnifiedRed's 16 MB reserve, past the VRAM size Apple now sees. Harmless so far.
+- The Carrizo DDC line set-up before EDID reads wrote DCE 11 offsets directly; translated now.
+
 ## Plan
 
 1. **Hardware that boots.** Either Kabini past the freeze (`krprobepanic`), or a Kaveri machine. Collect the Linux

@@ -4096,6 +4096,13 @@ static void diskLogTick(uint32_t t, uint32_t stallTicks) {
 			add(" | uvd %x %x %x %x %x/%x vce %x %x %x %x/%x\n", mmio[0x3DAF], mmio[0x3D98], mmio[0x3DA0], mmio[0x3D67],
 				mmio[0x3DA4], mmio[0x3DA5], mmio[0x8001], mmio[0x8005], mmio[0x8048], mmio[0x8063], mmio[0x8064]);
 		}
+	} else if (mmio && gcn2Gpu) {
+		// GCN 2 (no SMU 8 load to wait for): GRBM_STATUS/2, CP_STAT, CP_ME_CNTL, CP_MEC_CNTL, gfx ring rptr/wptr, sDMA0/1
+		// rptr/wptr (Polaris offsets through the table), IH rptr/wptr (CIK) and handler calls.
+		auto rd = [mmio](uint32_t polaris) { return mmio[Dce8Map::translate(polaris) & 0xFFFF]; };
+		add("%llu | gcn2 grbm %08x %08x cp %08x me %x mec %x | gfx %x/%x | sdma %x/%x %x/%x | ih %x/%x calls %u\n", ms,
+			rd(0x2004), rd(0x2002), rd(0x21A0), rd(0x21B6), rd(0x208D), rd(0x21C0), rd(0x3045), rd(0x3483), rd(0x3484),
+			rd(0x3683), rd(0x3684), mmio[0xF82], mmio[0xF83], __atomic_load_n(&ihHandlerCalls, __ATOMIC_RELAXED));
 	} else {
 		add(asleep ? "%llu | t=%u, GPU asleep (no register reads)\n" : "%llu | t=%u, GPU not up yet\n", ms, t);
 	}
@@ -4192,7 +4199,7 @@ static size_t gcn2DisplayState(ChipFamily family, char *buf, size_t size, bool r
 		add("crtc%u %s ctl %x: total %ux%u, hblank %x vblank %x, pos %x, rate %x; grph %s ctl %x at %x:%08x pitch %u "
 			"end %ux%u, lb fmt %x\n", pipe, (ctl & 1) ? "on" : "off", ctl, (m[CRTC_H_TOTAL + o] & 0x3FFF) + 1,
 			(m[CRTC_V_TOTAL + o] & 0x3FFF) + 1, m[CRTC_H_BLANK_START_END + o], m[CRTC_V_BLANK_START_END + o],
-			m[CRTC_STATUS_POSITION + o], m[CRTC0_PIXEL_RATE_CNTL + 4 * pipe], (grph & 1) ? "on" : "off", m[GRPH_CONTROL + o],
+			raw ? m[CRTC_STATUS_POSITION + o] : 0, m[CRTC0_PIXEL_RATE_CNTL + 4 * pipe], (grph & 1) ? "on" : "off", m[GRPH_CONTROL + o],
 			m[GRPH_PRIMARY_SURFACE_ADDRESS_HIGH + o], m[GRPH_PRIMARY_SURFACE_ADDRESS + o], m[GRPH_PITCH + o],
 			m[GRPH_X_END + o], m[GRPH_Y_END + o], m[LB_DATA_FORMAT + o]);
 	}
@@ -5182,13 +5189,22 @@ namespace {
 			if (ddcPrepOff < 0)
 				ddcPrepOff = checkKernelArgument("-crnoddcprep") ? 1 : 0;
 			uint32_t line = arg & 0xFF;
-			uint16_t speedReg = static_cast<uint16_t>(0x16DE + 2 * line), setupReg = static_cast<uint16_t>(speedReg + 1),
-				maskReg = static_cast<uint16_t>(0x4868 + 4 * line);
-			if (!ddcPrepOff) {
+			uint32_t speedReg = 0x16DE + 2 * line, setupReg = speedReg + 1, maskReg = 0x4868 + 4 * line, timeBase = 0x13B;
+			// GCN 2: these are DCE 11.2 offsets (DC_I2C_DDCn_SPEED/SETUP, DC_GPIO_DDCn_MASK, MICROSECOND_TIME_BASE_DIV);
+			// DCE 8 has the same registers elsewhere (kern_dce8map.hpp).
+			if (gcn2Gpu) {
+				speedReg = Dce8Map::translate(speedReg);
+				setupReg = Dce8Map::translate(setupReg);
+				maskReg = Dce8Map::translate(maskReg);
+				timeBase = Dce8Map::translate(timeBase);
+			}
+			bool mapped = speedReg != Dce8Map::None && setupReg != Dce8Map::None && maskReg != Dce8Map::None &&
+				timeBase != Dce8Map::None;
+			if (!ddcPrepOff && mapped) {
 				uint32_t mask = gpuMmio[maskReg], speed = gpuMmio[speedReg], setup = gpuMmio[setupReg];
 				uint32_t newMask = mask & ~0x101U, newSpeed = speed, newSetup = setup;
 				if (!(speed >> 16)) {
-					uint32_t tb = gpuMmio[0x13B];
+					uint32_t tb = gpuMmio[timeBase];
 					uint32_t refBaseDiv = tb & 0x7F, xtalRefDiv = (tb >> 8) & 0x7F;
 					if (!xtalRefDiv)
 						xtalRefDiv = 2;
@@ -5208,7 +5224,7 @@ namespace {
 				if ((newMask != mask || newSpeed != speed || newSetup != setup) && prepLogged++ < 8)
 					diskLogEvent("hdmi: DDC%u set up for the hardware I2C engine: pad mask %x -> %x, speed %x -> %x, setup %x -> %x "
 						"(time base %x)", line + 1, mask, gpuMmio[maskReg], speed, gpuMmio[speedReg], setup, gpuMmio[setupReg],
-						gpuMmio[0x13B]);
+						gpuMmio[timeBase]);
 			}
 		}
 		// GCN 2: the multimedia engines (UVD, VCE, SAMU) stay out of the accelerator's memory set-up, as they stay out
