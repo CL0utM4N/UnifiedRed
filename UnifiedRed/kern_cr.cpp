@@ -5513,6 +5513,7 @@ static uint64_t wrapEndVMPTUpdate(void *that) {
 	return vfunc<uint64_t (*)(void *, uint32_t)>(channel, 0x160)(channel, 0);
 }
 static bool wrapPowerUpHWEngines(void *that);
+static bool powerUpKeepMm;  // Carrizo: the wrapper powers video up but leaves Apple's UVD/VCE/SAMU power-ups alone
 
 // GCN 2: AMDRadeonX4000's VI layer reaches the GPU through AMDHWRegisters::read/write (dword offsets; the
 // read-modify-write helpers call both through the vtable). Same table as the controller's (kern_dce8map.hpp, with the
@@ -5667,6 +5668,18 @@ void CRDriver::patchAccelerator(KernelPatcher &patcher, size_t index, mach_vm_ad
 			reinterpret_cast<mach_vm_address_t>(wrapGetHWChannel), orgGetHWChannel,
 			catalina ? channelChecksCatalina : channelChecks, 0x26,
 			"getHWChannel");
+	}
+	// Carrizo (A8-7680, 2026-11-21): the powerUpHWEngines route above is Stoney-only (its sDMA fix), so with -crvideo
+	// the SMU never powered UVD/VCE (smuVideoPowerOn runs in the wrapper) and every session was refused ("video not
+	// powered"). Route it for -crvideo; Apple's own power-up of UVD, VCE and SAMU stays as it was (no Stoney skip).
+	if (family == ChipFamily::Carrizo && checkKernelArgument("-crvideo")) {
+		bool catalina = getKernelVersion() == KernelVersion::Catalina;
+		static const char *const powerUpChecks[] {"4b8bbcfeb0030000|498bbcdeb0030000", nullptr};
+		static const char *const powerUpChecksCatalina[] {"498bbcde40030000", nullptr};
+		powerUpKeepMm = true;
+		route("__ZN26AMDRadeonX4000_AMDHardware16powerUpHWEnginesEv",
+			reinterpret_cast<mach_vm_address_t>(wrapPowerUpHWEngines), orgPowerUpHWEngines,
+			catalina ? powerUpChecksCatalina : powerUpChecks, 0x30, "powerUpHWEngines");
 	}
 	// Video decode for AppleGVA (see wrapConfigureDevice); -crnogva leaves it, as it does the board-id routing.
 	if (checkKernelArgument("-crvideo") && !checkKernelArgument("-crnogva"))
@@ -5856,7 +5869,7 @@ static bool wrapPowerUpHWEngines(void *that) {
 	bool video = checkKernelArgument("-crvideo");
 	if (video)
 		smuVideoPowerOn();
-	bool skip = !checkKernelArgument("-crmm");
+	bool skip = !checkKernelArgument("-crmm") && !powerUpKeepMm;
 	// Restore only the slots emptied here: restoring all three wrote the unsaved nullptr over UVD and VCE with -crvideo,
 	// and every video session then failed in AMDAccelUVDContext::init (getHWEngine(5) = 0).
 	size_t first = video ? 2 : 0;
