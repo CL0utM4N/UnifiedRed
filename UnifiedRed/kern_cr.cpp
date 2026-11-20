@@ -274,6 +274,11 @@ static uint32_t dce8DroppedFirst[48], dce8DroppedFirstCount;
 // through its own mapping and sees the real size.
 static constexpr uint32_t Gcn2ReserveMb = 16;
 static uint32_t gcn2MemMb, gcn2MemSizeFixes;
+// GCN 2: the CPU's real window onto VRAM, PCI BAR0 (256 MB on the A6-7400K). AMDVIHWMemory::getHWMemoryApertureSize
+// takes the CPU-visible VRAM size from CONFIG_APER_SIZE (0x150C, MB) instead; Linux ignores that register on APUs and
+// uses the BAR's length (radeon cik_mc_init, amdgpu gmc_v7_0_mc_init). A larger value would have Apple write VRAM above
+// 256 MB through BAR0 + offset, i.e. past the BAR into the APIC / flash range above it. Reads are clamped to BAR0.
+static uint32_t gcn2BarMb, gcn2AperRaw, gcn2AperFixes;
 static uint64_t gcn2ReservePhys;
 static bool gcn2Gpu;  // the iGPU is a GCN 2 APU (set at detection; for code that runs before `callback` is usable)
 static bool dce8Translate(uint32_t &byteOffset, bool write, uint32_t value, mach_vm_address_t ra);
@@ -325,7 +330,7 @@ struct TraceEvent {
 	bool exit;
 };
 
-static constexpr size_t TraceRingSize = 512, MaxTraceStages = 224;
+static constexpr size_t TraceRingSize = 512, MaxTraceStages = 240;
 // Catalina's GPU power-up runs ~40 s longer than Sonoma's (slow CAIL waits) but completes, so it gets more room.
 static constexpr uint64_t WatchdogMs = 60000, WatchdogMsCatalina = 180000;
 static TraceEvent traceRing[TraceRingSize];
@@ -4923,6 +4928,16 @@ namespace {
 			InAccel, true, false, 0},
 		{"__ZN35AMDRadeonX4000_AMDAccelVideoContext11contextStopEv", "vid.contextStop", InAccel, true, false, 0},
 		{"__ZN26AMDRadeonX4000_AMDHardware23allocateMemoryResourcesEv", "hw.allocateMemoryResources", InAccel, true, true, 0},
+		// One level down, for GCN 2's start-up record (the boot of 8b0d0e3 froze inside the one above): each engine's,
+		// and the PM4 and DMA channels'.
+		{"__ZN26AMDRadeonX4000_AMDHWEngine23allocateMemoryResourcesEv", "hw.engine.allocateMemoryResources", InAccel, false,
+			false, 0},
+		{"__ZN27AMDRadeonX4000_AMDHWChannel23allocateMemoryResourcesEv", "hw.channel.allocateMemoryResources", InAccel, false,
+			false, 0},
+		{"__ZN30AMDRadeonX4000_AMDPM4HWChannel23allocateMemoryResourcesEv", "hw.pm4channel.allocateMemoryResources", InAccel,
+			false, false, 0},
+		{"__ZN30AMDRadeonX4000_AMDDMAHWChannel23allocateMemoryResourcesEv", "hw.dmachannel.allocateMemoryResources", InAccel,
+			false, false, 0},
 		{"__ZN28AMDRadeonX4000_AMDVIHardware16initializeVMRegsEv", "hw.initializeVMRegs", InAccel, true, true, 0},
 		{"__ZN26AMDRadeonX4000_AMDHardware27initializeHardwareRegistersEv", "hw.initializeHardwareRegisters", InAccel, true, true, 0},
 		{"__ZN26AMDRadeonX4000_AMDHardware19initializeHWEnginesEv", "hw.initializeHWEngines", InAccel, true, true, 0},
@@ -5224,7 +5239,7 @@ namespace {
 
 #define CR_WRAP(n) reinterpret_cast<mach_vm_address_t>(wrapStage<n>)
 	void routeStages(KernelPatcher &patcher, size_t index, mach_vm_address_t slide, size_t size, TraceKext kext) {
-		static_assert(arrsize(stages) == 221, "one wrapper per stage");
+		static_assert(arrsize(stages) == 225, "one wrapper per stage");
 		mach_vm_address_t wrappers[] {
 			CR_WRAP(0), CR_WRAP(1), CR_WRAP(2), CR_WRAP(3), CR_WRAP(4), CR_WRAP(5), CR_WRAP(6), CR_WRAP(7),
 			CR_WRAP(8), CR_WRAP(9), CR_WRAP(10), CR_WRAP(11), CR_WRAP(12), CR_WRAP(13), CR_WRAP(14), CR_WRAP(15),
@@ -5254,7 +5269,7 @@ namespace {
 			CR_WRAP(193), CR_WRAP(194), CR_WRAP(195), CR_WRAP(196), CR_WRAP(197), CR_WRAP(198), CR_WRAP(199), CR_WRAP(200),
 			CR_WRAP(201), CR_WRAP(202), CR_WRAP(203), CR_WRAP(204), CR_WRAP(205), CR_WRAP(206), CR_WRAP(207), CR_WRAP(208),
 			CR_WRAP(209), CR_WRAP(210), CR_WRAP(211), CR_WRAP(212), CR_WRAP(213), CR_WRAP(214), CR_WRAP(215), CR_WRAP(216),
-			CR_WRAP(217), CR_WRAP(218), CR_WRAP(219), CR_WRAP(220),
+			CR_WRAP(217), CR_WRAP(218), CR_WRAP(219), CR_WRAP(220), CR_WRAP(221), CR_WRAP(222), CR_WRAP(223), CR_WRAP(224),
 		};
 		for (size_t i = 0; i < arrsize(stages); i++) {
 			if (stages[i].kext != kext)
@@ -8693,6 +8708,14 @@ static uint32_t dce8LbFix(uint32_t dword, uint32_t value) {
 // CONFIG_MEMSIZE (0x150A, the same on BIF 4.1 and 5.0) as Apple's drivers see it: the carve-out minus the reserve.
 // AMDVIHWMemory::getHWMemorySize sizes VRAM from it; AMDVIHardware::setMemSizeRegister writes it back.
 static uint32_t gcn2MemSizeRead(uint32_t dword, uint32_t value) {
+	if (dword == 0x150C && gcn2BarMb) {
+		gcn2AperRaw = value;
+		if (value > gcn2BarMb) {
+			__atomic_fetch_add(&gcn2AperFixes, 1, __ATOMIC_RELAXED);
+			return gcn2BarMb;
+		}
+		return value;
+	}
 	if (dword != 0x150A || !gcn2MemMb || (value & 0xFFFF) != gcn2MemMb)
 		return value;
 	__atomic_fetch_add(&gcn2MemSizeFixes, 1, __ATOMIC_RELAXED);
@@ -10523,6 +10546,10 @@ void CRDriver::probeMMIO() {
 		gcn2DisplayState(family, display, sizeof(display), false);
 		SYSLOG("cr", "DCE 8 display state at start-up: %s", display);
 		iGPU->setProperty("UnifiedRed,gcn2-display", display);
+		if (auto *bar = iGPU->getDeviceMemoryWithRegister(kIOPCIConfigBaseAddress0))
+			gcn2BarMb = static_cast<uint32_t>(bar->getLength() >> 20);
+		gcn2AperRaw = mmio[0x150C];
+		SYSLOG("cr", "GCN 2: BAR0 %u MB, CONFIG_APER_SIZE reads %x", gcn2BarMb, gcn2AperRaw);
 		if (memSize > 2 * Gcn2ReserveMb && carveoutPhys && !checkKernelArgument("-crnogcn2reserve")) {
 			gcn2MemMb = memSize & 0xFFFF;
 			gcn2ReservePhys = carveoutPhys + (static_cast<uint64_t>(gcn2MemMb - Gcn2ReserveMb) << 20);
@@ -15422,7 +15449,7 @@ static void gcn2Breadcrumb(uint32_t t, const char *tree) {
 		t, gcn2CrumbWrites, rd(0x2004), rd(0x2002), rd(0x394), rd(0x21C0), rd(0x3045), rd(0x21B6), rd(0x3483), rd(0x3484),
 		rd(0x3683), rd(0x3684), rd(0x340D), m[CikIh::RbCntl + 2], m[CikIh::RbCntl + 3], m[Reg::MC_VM_FB_LOCATION],
 		rd(0x504), rd(0x536), rd(0x538));
-	add("mm emptied %u | ", gcn2MmEmptied);
+	add("mm emptied %u bar %u aper %x (clamped %u) | ", gcn2MmEmptied, gcn2BarMb, gcn2AperRaw, gcn2AperFixes);
 	add("map %s/%s moved %u dropped %u mc %u vals %u ih %u/%u ring %s | cail %u/%u", dce8Remap ? "on" : "off",
 		accelRegMap ? "on" : "off", dce8Moved, dce8Dropped, dce8McWritesDropped, gcn2ValueFixes,
 		__atomic_load_n(&ihHandlerCalls, __ATOMIC_RELAXED), ihTongaWrites, ihMoveResult ? ihMoveResult : "-", cailWaits,
