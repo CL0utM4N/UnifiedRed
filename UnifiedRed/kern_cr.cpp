@@ -15450,6 +15450,10 @@ static void gcn2Breadcrumb(uint32_t t, const char *tree) {
 		rd(0x3683), rd(0x3684), rd(0x340D), m[CikIh::RbCntl + 2], m[CikIh::RbCntl + 3], m[Reg::MC_VM_FB_LOCATION],
 		rd(0x504), rd(0x536), rd(0x538));
 	add("mm emptied %u bar %u aper %x (clamped %u) | ", gcn2MmEmptied, gcn2BarMb, gcn2AperRaw, gcn2AperFixes);
+	// The memory controller's apertures (GMC 7.1 = 8.1 offsets): system aperture low/high and default, AGP top/bot/base,
+	// FB offset, HDP non-surface base/info/size, BIF_FB_EN, and the FB move (old -> new MC_VM_FB_LOCATION).
+	add("mc sys %x-%x def %x agp %x/%x/%x off %x hdp %x/%x/%x fben %x reloc %x->%x | ", m[0x80D], m[0x80E], m[0x80F],
+		m[0x80A], m[0x80B], m[0x80C], m[0x81A], m[0xB01], m[0xB02], m[0xB03], m[0x1524], fbRelocOld, fbRelocNew);
 	add("map %s/%s moved %u dropped %u mc %u vals %u ih %u/%u ring %s | cail %u/%u", dce8Remap ? "on" : "off",
 		accelRegMap ? "on" : "off", dce8Moved, dce8Dropped, dce8McWritesDropped, gcn2ValueFixes,
 		__atomic_load_n(&ihHandlerCalls, __ATOMIC_RELAXED), ihTongaWrites, ihMoveResult ? ihMoveResult : "-", cailWaits,
