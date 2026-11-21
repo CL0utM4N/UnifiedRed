@@ -1773,8 +1773,7 @@ void CRDriver::processKext(KernelPatcher &patcher, size_t index, mach_vm_address
 					if (!blocked)
 						patcher.clearError();
 					IOLog("UnifiedRed: acceleration off: %s; display only (%s). Update macOS to a supported build; "
-						"-craccelanyway tries anyway
-", accelUnsafeWhy, blocked ? "accelerator blocked" : "BLOCK FAILED");
+						"-craccelanyway tries anyway\n", accelUnsafeWhy, blocked ? "accelerator blocked" : "BLOCK FAILED");
 					traceNote("accel=off(%s)%s ", accelUnsafeWhy, blocked ? "" : "blockfail");
 				} else {
 					traceKext(patcher, index, slide, size, i);
