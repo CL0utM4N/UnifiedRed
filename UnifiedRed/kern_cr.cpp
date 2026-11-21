@@ -11702,6 +11702,7 @@ static struct {
 	uint32_t rings, ibs, relocs, unknown, bad, sessCtxDropped, vmid;
 	uint64_t dtVa, fbVa, firstMs;  // the last decode target / feedback (VMID addresses), for the watcher's samples
 	uint64_t bsVa, dpbVa, ctxVa;   // and bitstream (0x100), DPB (1), H264_PERF context (0x206)
+	uint64_t itVa, sessVa;         // IT scaling table (0x204), session context (5)
 } uvdBridge;
 
 // a712cf8 log 1794546450: the first frame's luma has data in rows 0-47 only (3 macroblock rows), the firmware wrote its
@@ -11872,6 +11873,24 @@ static void uvdFrameCheck(uint32_t vmid, uint64_t msgVa) {
 		if (j.slices < arrsize(j.firstMbs))
 			j.firstMbs[j.slices] = (1U << zeros) - 1 + v;
 		j.slices++;
+	}
+	// The IT scaling table (0x204; Mesa copies the H.264 4x4 lists to its start and the 8x8 lists at +96 for H264_PERF:
+	// flat lists are 16 everywhere) and, with -cruvdsessctx, the session context's first dwords.
+	if (j.seq < 2) {
+		uint32_t it[32] {}, ss[8] {};
+		if (uvdBridge.itVa)
+			if (auto *p = uvdVaPtr(vmid, uvdBridge.itVa, sizeof(it))) {
+				flushLines(p, sizeof(it));
+				memcpy(it, p, sizeof(it));
+			}
+		if (uvdBridge.sessVa)
+			if (auto *p = uvdVaPtr(vmid, uvdBridge.sessVa, sizeof(ss))) {
+				flushLines(p, sizeof(ss));
+				memcpy(ss, p, sizeof(ss));
+			}
+		diskLogEvent("uvd frame %u it table %llx: %x %x %x %x %x %x %x %x | +96: %x %x %x %x %x %x %x %x; session ctx %llx: %x %x %x %x",
+			j.seq, uvdBridge.itVa, it[0], it[1], it[2], it[3], it[4], it[5], it[6], it[7], it[24], it[25], it[26], it[27],
+			it[28], it[29], it[30], it[31], uvdBridge.sessVa, ss[0], ss[1], ss[2], ss[3]);
 	}
 	// Apple's raw entries (with the fragment field, bits 7-11) for the bitstream's and target's first pages.
 	if (j.seq < 3) {
@@ -12045,6 +12064,10 @@ static bool uvdBridgeIb(uint32_t vmid, uint64_t ibVa, uint32_t len, uint64_t &ib
 						uvdBridge.dpbVa = a;
 					else if (cmd == 0x206)
 						uvdBridge.ctxVa = a;
+					else if (cmd == 0x204)
+						uvdBridge.itVa = a;
+					else if (cmd == 5)
+						uvdBridge.sessVa = a;
 				}
 				if ((cmd == 2 || cmd == 3) && data0 != ~0U && data1 != ~0U) {
 					(cmd == 2 ? uvdBridge.dtVa : uvdBridge.fbVa) = static_cast<uint64_t>(at(data1)) << 32 | at(data0);
