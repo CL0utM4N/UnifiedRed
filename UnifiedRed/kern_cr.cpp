@@ -11112,6 +11112,50 @@ static uint64_t vmPteRaw(uint32_t vmid, uint64_t va) {
 	return (entry & 1) ? entry : 0;
 }
 
+// n consecutive raw PTEs from va (0 where invalid), read a page table at a time; the count read (stops at a hole in
+// the directory). For the bridge's refresh, which checks thousands of entries per job.
+static uint32_t vmPteRun(uint32_t vmid, uint64_t va, uint32_t n, uint64_t *out) {
+	auto *mmio = gpuMmio;
+	if (!mmio || !vmid || vmid > 15)
+		return 0;
+	uint32_t cntl = mmio[0x505], start = mmio[0x558], end = mmio[0x560];
+	uint32_t depth = (cntl >> 1) & 3, block = (cntl >> 24) & 0xF, bits = 9 + block;
+	uint64_t pdb = static_cast<uint64_t>(vmid < 8 ? mmio[0x54F + vmid] : mmio[0x50E + vmid - 8]) << 12;
+	uint32_t done = 0;
+	while (done < n) {
+		uint64_t page = (va >> 12) + done;
+		if (page < start || page > end)
+			break;
+		uint64_t pfn = page - start, base;
+		uint32_t room;
+		if (depth == 0) {
+			base = ibMcToPhys(pdb, false) + pfn * 8;
+			room = n - done;
+		} else {
+			uint64_t pde = 0;
+			if (!ibReadPhys(ibMcToPhys(pdb, false) + (pfn >> bits) * 8, 8, &pde) || !(pde & 1))
+				break;
+			uint64_t idx = pfn & ((1ULL << bits) - 1);
+			base = ibMcToPhys(pde & 0xFFFFFFFFF000ULL, pde & 2) + idx * 8;
+			room = static_cast<uint32_t>((1ULL << bits) - idx);
+		}
+		uint32_t k = room < n - done ? room : n - done;
+		// ibReadPhys within one 4 KB page at a time.
+		while (k) {
+			uint32_t inPage = static_cast<uint32_t>((0x1000 - (base & 0xFFF)) / 8), c = k < inPage ? k : inPage;
+			if (!ibReadPhys(base, c * 8, out + done))
+				return done;
+			for (uint32_t i = 0; i < c; i++)
+				if (!(out[done + i] & 1))
+					out[done + i] = 0;
+			done += c;
+			base += c * 8;
+			k -= c;
+		}
+	}
+	return done;
+}
+
 static struct {
 	bool tried, ok, dirty;
 	uint64_t windowVa;  // GART address of slot 0
@@ -11120,6 +11164,7 @@ static struct {
 	uint64_t tailValue;
 	uint32_t blocks, maps, pages, reuses, mapFails, relocs, unknownCmds, lastUnknown, badLen, wraps;
 	uint32_t uvdDpbSlot;  // first of the fixed slots for UVD's own DPB (0: none)
+	uint32_t refreshChecks, refreshed;  // reused pages checked against Apple's tables, and entries rewritten
 } vceBridge;
 static constexpr uint32_t VceBridgeUvdDpbSlots = 0x1000;  // 16 MB
 
@@ -11264,6 +11309,32 @@ static uint64_t vceBridgeMap(uint32_t vmid, uint64_t va, uint64_t bytes) {
 			vmPteRaw(vmid, e.va + ((static_cast<uint64_t>(e.pages) / 2) << 12)) == e.pteM) {
 			b.reuses++;
 			e.job = vceBridgeJob;
+			// A8-7680 573c671 log 1576951283: a UVD frame whose bitstream fits in its first page decodes completely,
+			// longer ones stop after a few macroblock rows. The checks above see three entries of the mapping; Apple may
+			// have moved the pages in between (a buffer pool in one VA range). Check every page of this request and
+			// rewrite a changed entry in place. -crnobridgerefresh skips it.
+			if (!checkKernelArgument("-crnobridgerefresh")) {
+				static uint64_t run[512];
+				uint32_t n = static_cast<uint32_t>(e.pages - off) < pages ? static_cast<uint32_t>(e.pages - off) : pages, got = 0;
+				for (uint32_t i = 0; i < n; i++) {
+					if (i % 512 == 0)
+						got = vmPteRun(vmid, pageVa + (static_cast<uint64_t>(i) << 12), n - i < 512 ? n - i : 512, run);
+					if (i % 512 >= got)
+						break;
+					uint64_t now = run[i % 512] & ~0xF80ULL;
+					auto &g = b.pte[e.slot + off + i];
+					b.refreshChecks++;
+					if (now && g != now) {
+						static uint32_t refreshLogs;
+						if (refreshLogs++ < 8)
+							diskLogEvent("bridge refresh: vmid %u va %llx (page %u of a reused mapping at %llx): entry %llx -> %llx",
+								vmid, pageVa + (static_cast<uint64_t>(i) << 12), static_cast<uint32_t>(off + i), e.va, g, now);
+						g = now;
+						b.refreshed++;
+						b.dirty = true;
+					}
+				}
+			}
 			return b.windowVa + (static_cast<uint64_t>(e.slot) << 12) + (va - e.va);
 		}
 		e.pages = 0;  // changed or too short: map afresh
@@ -11791,6 +11862,14 @@ static void uvdFrameCheck(uint32_t vmid, uint64_t msgVa) {
 			j.firstMbs[j.slices] = (1U << zeros) - 1 + v;
 		j.slices++;
 	}
+	// Apple's raw entries (with the fragment field, bits 7-11) for the bitstream's and target's first pages.
+	if (j.seq < 3) {
+		auto pte = [&](uint64_t va, uint32_t i) { return vmPteRaw(vmid, (va & ~0xFFFULL) + (static_cast<uint64_t>(i) << 12)); };
+		diskLogEvent("uvd frame %u ptes: bitstream %llx: %llx %llx %llx %llx %llx %llx; target %llx: %llx %llx %llx %llx "
+			"%llx %llx; bridge refresh %u checked, %u rewritten", j.seq, j.bs, pte(j.bs, 0), pte(j.bs, 1), pte(j.bs, 2),
+			pte(j.bs, 3), pte(j.bs, 16), pte(j.bs, 17), j.dt, pte(j.dt, 0), pte(j.dt, 1), pte(j.dt, 2), pte(j.dt, 3),
+			pte(j.dt, 16), pte(j.dt, 17), vceBridge.refreshChecks, vceBridge.refreshed);
+	}
 	uint32_t last;
 	if (j.pitch && j.h && j.h <= 2304) {
 		uvdRows(vmid, j.dt + j.lumaTop, j.pitch, j.h, true, last);
@@ -11808,10 +11887,11 @@ static void uvdFrameCheck(uint32_t vmid, uint64_t msgVa) {
 	uvdJobsChecked++;
 	uvdJobStats[!luma ? 0 : luma * 4 < o.h ? 1 : luma * 2 < o.h ? 2 : luma < o.h ? 3 : 4]++;
 	diskLogEvent("uvd frame %u: %ux%u%s, bitstream %x bytes (read %x), %u slice(s) first MBs %u %u %u %u %u %u; luma rows %u/%u "
-		"(last %u), chroma %u/%u (last %u); totals none %u <1/4 %u <1/2 %u partial %u full %u", o.seq, o.w, o.h,
+		"(last %u), chroma %u/%u (last %u); totals none %u <1/4 %u <1/2 %u partial %u full %u; refresh %u/%u", o.seq, o.w, o.h,
 		o.idr ? " IDR" : "", o.bsd, o.bsd < sizeof(uvdBsBuf) ? o.bsd : static_cast<uint32_t>(sizeof(uvdBsBuf)), o.slices,
 		o.firstMbs[0], o.firstMbs[1], o.firstMbs[2], o.firstMbs[3], o.firstMbs[4], o.firstMbs[5], luma, o.h, lumaLast,
-		chroma, o.h / 2, chromaLast, uvdJobStats[0], uvdJobStats[1], uvdJobStats[2], uvdJobStats[3], uvdJobStats[4]);
+		chroma, o.h / 2, chromaLast, uvdJobStats[0], uvdJobStats[1], uvdJobStats[2], uvdJobStats[3], uvdJobStats[4],
+		vceBridge.refreshed, vceBridge.refreshChecks);
 }
 
 static bool uvdBridgeIb(uint32_t vmid, uint64_t ibVa, uint32_t len, uint64_t &ibGart) {
