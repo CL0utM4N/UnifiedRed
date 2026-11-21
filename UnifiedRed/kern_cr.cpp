@@ -11769,7 +11769,7 @@ static uint64_t uvdCmdExtent(uint32_t cmd) {
 // runs; two jobs later count the rows the decoder wrote (and the last one). -crnouvdcheckframes leaves it.
 static constexpr uint32_t UvdCheckJobs = 40;
 static struct UvdJob {
-	uint64_t dt, bs;
+	uint64_t dt, bs, fb;
 	uint32_t vmid, w, h, pitch, lumaTop, chromaTop, bsd, slices, idr, firstMbs[6], seq;
 } uvdJobs[4];
 static uint32_t uvdJobSeq, uvdJobsChecked, uvdJobStats[5];  // stats: none, <1/4, <1/2, <full, full luma rows
@@ -11821,6 +11821,7 @@ static void uvdFrameCheck(uint32_t vmid, uint64_t msgVa) {
 	j.vmid = vmid;
 	j.dt = uvdBridge.dtVa;
 	j.bs = uvdBridge.bsVa;
+	j.fb = uvdBridge.fbVa;
 	j.w = rd(6);
 	j.h = rd(7);
 	j.bsd = rd(22);
@@ -11884,6 +11885,15 @@ static void uvdFrameCheck(uint32_t vmid, uint64_t msgVa) {
 	uint32_t lumaLast, chromaLast;
 	uint32_t luma = uvdRows(o.vmid, o.dt + o.lumaTop, o.pitch, o.h, false, lumaLast);
 	uint32_t chroma = uvdRows(o.vmid, o.dt + o.chromaTop, o.pitch, o.h / 2, false, chromaLast);
+	// The firmware's feedback for that job (its per-frame status: errors, macroblocks done?).
+	uint32_t fbw[16] {};
+	if (o.fb)
+		if (auto *p = uvdVaPtr(o.vmid, o.fb, sizeof(fbw))) {
+			flushLines(p, sizeof(fbw));
+			memcpy(fbw, p, sizeof(fbw));
+		}
+	diskLogEvent("uvd frame %u feedback: %x %x %x %x %x %x %x %x %x %x %x %x %x %x %x %x", o.seq, fbw[0], fbw[1], fbw[2],
+		fbw[3], fbw[4], fbw[5], fbw[6], fbw[7], fbw[8], fbw[9], fbw[10], fbw[11], fbw[12], fbw[13], fbw[14], fbw[15]);
 	uvdJobsChecked++;
 	uvdJobStats[!luma ? 0 : luma * 4 < o.h ? 1 : luma * 2 < o.h ? 2 : luma < o.h ? 3 : 4]++;
 	diskLogEvent("uvd frame %u: %ux%u%s, bitstream %x bytes (read %x), %u slice(s) first MBs %u %u %u %u %u %u; luma rows %u/%u "
