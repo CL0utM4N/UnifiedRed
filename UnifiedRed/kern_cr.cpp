@@ -11807,13 +11807,23 @@ static uint32_t uvdRows(uint32_t vmid, uint64_t va, uint32_t pitch, uint32_t row
 }
 
 static void uvdFrameCheck(uint32_t vmid, uint64_t msgVa) {
-	if (uvdJobSeq >= UvdCheckJobs + 2 || checkKernelArgument("-crnouvdcheckframes"))
+	if (checkKernelArgument("-crnouvdcheckframes"))
 		return;
 	auto rd = [&](uint32_t i) {
 		auto *p = vceIbDword(vmid, msgVa + i * 4);
 		return p ? *p : 0;
 	};
-	if (rd(1) != 1 || !uvdBridge.dtVa || !uvdBridge.bsVa)
+	// Each new session (a create message, type 0) starts the count again: one log per video, up to 4 videos.
+	static uint32_t sessions;
+	if (rd(1) == 0 && sessions < 4) {
+		sessions++;
+		uvdJobSeq = 0;
+		bzero(uvdJobs, sizeof(uvdJobs));
+		bzero(uvdJobStats, sizeof(uvdJobStats));
+		diskLogEvent("uvd frame check: session %u (stream handle %x, %ux%u)", sessions, rd(2), rd(7), rd(8));
+		return;
+	}
+	if (uvdJobSeq >= UvdCheckJobs + 2 || rd(1) != 1 || !uvdBridge.dtVa || !uvdBridge.bsVa)
 		return;
 	auto &j = uvdJobs[uvdJobSeq % arrsize(uvdJobs)];
 	j = {};
