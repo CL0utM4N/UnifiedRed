@@ -11683,7 +11683,11 @@ static uint64_t uvdCmdExtent(uint32_t cmd) {
 		case 1: return 0x4000000;            // DPB
 		case 2: return 0x1000000;            // decode target
 		case 0x100: return 0x800000;         // bitstream
-		default: return 0x400000;            // 0x204, 0x206 and the rest
+		// The context buffer is the message's dpb_reserved long: 0x47B800 (1148 pages) for 1080p H.264 (A8-7680 log
+		// 1576948977), past the old 4 MB cap, so its last 124 pages ran into the next mappings in the window (the next
+		// frame's IB and message). The mapping stops where Apple's allocation ends, so a high cap costs nothing.
+		case 0x206: return 0x2000000;
+		default: return 0x400000;            // 0x204 and the rest
 	}
 }
 
@@ -11758,6 +11762,15 @@ static bool uvdBridgeIb(uint32_t vmid, uint64_t ibVa, uint32_t len, uint64_t &ib
 							diskLogEvent("uvd msg: decode flags %x -> %x, luma bottom %x -> %x, chroma bottom %x -> %x (field %u); "
 								"size %x, dwords at 0xce0: %x %x %x %x", flags, rd(5), lumaBottom, rd(33), chromaBottom, rd(35),
 								field, rd(0), rd(0xCE0 / 4), rd(0xCE0 / 4 + 1), rd(0xCE0 / 4 + 2), rd(0xCE0 / 4 + 3));
+						// The codec section (Mesa ruvd_h264 from dword 56: profile, level, sps/pps flags, the byte fields,
+						// then the scaling lists), to compare with what Mesa fills in for the same stream.
+						if (msgFixLogs <= 2)
+							for (uint32_t base = 36; base < 76; base += 20)
+								diskLogEvent("uvd msg dwords %u..%u: %x %x %x %x %x %x %x %x %x %x %x %x %x %x %x %x %x %x %x %x",
+									base, base + 19, rd(base), rd(base + 1), rd(base + 2), rd(base + 3), rd(base + 4),
+									rd(base + 5), rd(base + 6), rd(base + 7), rd(base + 8), rd(base + 9), rd(base + 10),
+									rd(base + 11), rd(base + 12), rd(base + 13), rd(base + 14), rd(base + 15), rd(base + 16),
+									rd(base + 17), rd(base + 18), rd(base + 19));
 					}
 				}
 				// Opt-in experiment (-cruvdowndpb): neither Apple's Polaris firmware (805b16e log 1794547065) nor Stoney's
