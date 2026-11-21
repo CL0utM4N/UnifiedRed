@@ -11691,6 +11691,129 @@ static uint64_t uvdCmdExtent(uint32_t cmd) {
 	}
 }
 
+// Per-frame check (A8-7680, 2026-11-21): most 1080p frames have only their top 40-60 rows written, some all of them.
+// The test video is the VCE screen recording, and a hardware encoder may cut each frame into several slices: does
+// the decoder only do the first? For the first UvdCheckJobs decode jobs: count the bitstream's slice NAL units and
+// their first_mb_in_slice; clear the first 16 bytes of every luma and chroma row of the decode target before the job
+// runs; two jobs later count the rows the decoder wrote (and the last one). -crnouvdcheckframes leaves it.
+static constexpr uint32_t UvdCheckJobs = 40;
+static struct UvdJob {
+	uint64_t dt, bs;
+	uint32_t vmid, w, h, pitch, lumaTop, chromaTop, bsd, slices, idr, firstMbs[6], seq;
+} uvdJobs[4];
+static uint32_t uvdJobSeq, uvdJobsChecked, uvdJobStats[5];  // stats: none, <1/4, <1/2, <full, full luma rows
+static uint8_t uvdBsBuf[0x10000];
+
+static uint8_t *uvdVaPtr(uint32_t vmid, uint64_t va, uint32_t bytes) {
+	uint64_t phys = ibVaToPhys(vmid, va);
+	if (!phys)
+		return nullptr;
+	if (auto *p = carvePtr(phys, bytes))
+		return p;
+	return physmapPtr(phys, bytes);
+}
+
+// Rows of the plane at va (pitch bytes apart) whose first 16 bytes are non-zero (or, clear: zero them).
+static uint32_t uvdRows(uint32_t vmid, uint64_t va, uint32_t pitch, uint32_t rows, bool clear, uint32_t &last) {
+	uint32_t n = 0;
+	last = 0;
+	for (uint32_t r = 0; r < rows; r++) {
+		auto *p = reinterpret_cast<volatile uint32_t *>(uvdVaPtr(vmid, va + static_cast<uint64_t>(r) * pitch, 16));
+		if (!p)
+			continue;
+		if (clear) {
+			p[0] = p[1] = p[2] = p[3] = 0;
+			flushLines(const_cast<const uint8_t *>(reinterpret_cast<volatile uint8_t *>(p)), 16);
+		} else {
+			flushLines(const_cast<const uint8_t *>(reinterpret_cast<volatile uint8_t *>(p)), 16);
+			if (p[0] | p[1] | p[2] | p[3]) {
+				n++;
+				last = r;
+			}
+		}
+	}
+	return n;
+}
+
+static void uvdFrameCheck(uint32_t vmid, uint64_t msgVa) {
+	if (uvdJobSeq >= UvdCheckJobs + 2 || checkKernelArgument("-crnouvdcheckframes"))
+		return;
+	auto rd = [&](uint32_t i) {
+		auto *p = vceIbDword(vmid, msgVa + i * 4);
+		return p ? *p : 0;
+	};
+	if (rd(1) != 1 || !uvdBridge.dtVa || !uvdBridge.bsVa)
+		return;
+	auto &j = uvdJobs[uvdJobSeq % arrsize(uvdJobs)];
+	j = {};
+	j.seq = uvdJobSeq++;
+	j.vmid = vmid;
+	j.dt = uvdBridge.dtVa;
+	j.bs = uvdBridge.bsVa;
+	j.w = rd(6);
+	j.h = rd(7);
+	j.bsd = rd(22);
+	j.pitch = rd(28);
+	j.lumaTop = rd(32);
+	j.chromaTop = rd(34);
+	// The bitstream's slices: start codes 00 00 01, NAL type 1 (slice) or 5 (IDR slice), first_mb_in_slice (ue(v)).
+	uint32_t size = j.bsd < sizeof(uvdBsBuf) ? j.bsd : sizeof(uvdBsBuf), got = 0;
+	while (got < size) {
+		uint64_t va = j.bs + got;
+		uint32_t chunk = 0x1000 - static_cast<uint32_t>(va & 0xFFF);
+		if (chunk > size - got)
+			chunk = size - got;
+		auto *p = uvdVaPtr(vmid, va, chunk);
+		if (!p)
+			break;
+		flushLines(p, chunk);
+		memcpy(uvdBsBuf + got, p, chunk);
+		got += chunk;
+	}
+	for (uint32_t i = 0; i + 4 < got; i++) {
+		if (uvdBsBuf[i] || uvdBsBuf[i + 1] || uvdBsBuf[i + 2] != 1)
+			continue;
+		uint32_t type = uvdBsBuf[i + 3] & 0x1F;
+		if (type != 1 && type != 5)
+			continue;
+		j.idr |= type == 5;
+		uint32_t bit = (i + 4) * 8, zeros = 0;
+		auto bitAt = [&](uint32_t b) { return b / 8 < got ? (uvdBsBuf[b / 8] >> (7 - b % 8)) & 1 : 1; };
+		while (!bitAt(bit) && zeros < 24) {
+			zeros++;
+			bit++;
+		}
+		bit++;
+		uint32_t v = 0;
+		for (uint32_t k = 0; k < zeros; k++)
+			v = v << 1 | bitAt(bit++);
+		if (j.slices < arrsize(j.firstMbs))
+			j.firstMbs[j.slices] = (1U << zeros) - 1 + v;
+		j.slices++;
+	}
+	uint32_t last;
+	if (j.pitch && j.h && j.h <= 2304) {
+		uvdRows(vmid, j.dt + j.lumaTop, j.pitch, j.h, true, last);
+		uvdRows(vmid, j.dt + j.chromaTop, j.pitch, j.h / 2, true, last);
+	}
+	// Two jobs back: done by now (UVD runs them in order; 30 fps leaves ~66 ms).
+	if (j.seq < 2)
+		return;
+	auto &o = uvdJobs[(j.seq - 2) % arrsize(uvdJobs)];
+	if (!o.pitch || !o.h || o.h > 2304)
+		return;
+	uint32_t lumaLast, chromaLast;
+	uint32_t luma = uvdRows(o.vmid, o.dt + o.lumaTop, o.pitch, o.h, false, lumaLast);
+	uint32_t chroma = uvdRows(o.vmid, o.dt + o.chromaTop, o.pitch, o.h / 2, false, chromaLast);
+	uvdJobsChecked++;
+	uvdJobStats[!luma ? 0 : luma * 4 < o.h ? 1 : luma * 2 < o.h ? 2 : luma < o.h ? 3 : 4]++;
+	diskLogEvent("uvd frame %u: %ux%u%s, bitstream %x bytes (read %x), %u slice(s) first MBs %u %u %u %u %u %u; luma rows %u/%u "
+		"(last %u), chroma %u/%u (last %u); totals none %u <1/4 %u <1/2 %u partial %u full %u", o.seq, o.w, o.h,
+		o.idr ? " IDR" : "", o.bsd, o.bsd < sizeof(uvdBsBuf) ? o.bsd : static_cast<uint32_t>(sizeof(uvdBsBuf)), o.slices,
+		o.firstMbs[0], o.firstMbs[1], o.firstMbs[2], o.firstMbs[3], o.firstMbs[4], o.firstMbs[5], luma, o.h, lumaLast,
+		chroma, o.h / 2, chromaLast, uvdJobStats[0], uvdJobStats[1], uvdJobStats[2], uvdJobStats[3], uvdJobStats[4]);
+}
+
 static bool uvdBridgeIb(uint32_t vmid, uint64_t ibVa, uint32_t len, uint64_t &ibGart) {
 	ibGart = vceBridgeMap(vmid, ibVa, static_cast<uint64_t>(len) * 4);
 	if (!ibGart)
@@ -11852,6 +11975,8 @@ static bool uvdBridgeIb(uint32_t vmid, uint64_t ibVa, uint32_t len, uint64_t &ib
 		}
 		idx += count + 2;
 	}
+	if (msgVa)
+		uvdFrameCheck(vmid, msgVa);
 	// The message (create, then decode): compare with Linux's amdgpu_uvd_cs_msg / Mesa's ruvd_msg layout.
 	if (msgVa && msgDumps < 2) {
 		msgDumps++;
