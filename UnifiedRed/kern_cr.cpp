@@ -1413,6 +1413,10 @@ void CRDriver::init() {
 }
 
 static uint64_t *physmapBaseVar, *physmapMaxVar;  // see physmapPtr
+// Set while the accelerator's routes are made when one Apple's driver can't run without is missing (its code doesn't
+// match a known macOS build): the accelerator's probe then reports no match, so the iGPU stays display-only instead of
+// panicking later (issue #4: Big Sur 11.0.1, Stoney, no sDMA channel at the first page-table update).
+static const char *accelUnsafeWhy;
 // The kernel's message buffer (bsd/sys/msgbuf.h), for mirrorKernelLog.
 struct KernelMsgBuf {
 	int magic, size, bufx, bufr;
@@ -1762,7 +1766,19 @@ void CRDriver::processKext(KernelPatcher &patcher, size_t index, mach_vm_address
 				"-crnoaccel");
 			if (!checkKernelArgument("-crnoaccel")) {
 				patchAccelerator(patcher, index, slide, size);
-				traceKext(patcher, index, slide, size, i);
+				if (accelUnsafeWhy && !checkKernelArgument("-craccelanyway")) {
+					KernelPatcher::RouteRequest request {"__ZN37AMDRadeonX4000_AMDGraphicsAccelerator5probeEP9IOServicePi",
+						wrapProbeNoMatch};
+					bool blocked = routeChecked(patcher, index, request, slide, size);
+					if (!blocked)
+						patcher.clearError();
+					IOLog("UnifiedRed: acceleration off: %s; display only (%s). Update macOS to a supported build; "
+						"-craccelanyway tries anyway
+", accelUnsafeWhy, blocked ? "accelerator blocked" : "BLOCK FAILED");
+					traceNote("accel=off(%s)%s ", accelUnsafeWhy, blocked ? "" : "blockfail");
+				} else {
+					traceKext(patcher, index, slide, size, i);
+				}
 			}
 		} else if (i == KextRadeonX4000HWServices) {
 			blockProbe(patcher, index, slide, size,
@@ -5640,10 +5656,12 @@ void CRDriver::patchAccelerator(KernelPatcher &patcher, size_t index, mach_vm_ad
 			"488b7b18|498b7f18|498b7e18", "ff9078010000", "66895008|66897008", nullptr};
 		static const char *const startChecksBigSur[] {"498bbcdeb8030000", "ff9048010000", "498b7e18", "ff9070010000",
 			"897008", nullptr};
-		if (route("__ZN32AMDRadeonX4000_AMDBaffinHardware17allocateHWEnginesEv",
-				reinterpret_cast<mach_vm_address_t>(wrapAllocateHWEngines), orgAllocateHWEngines,
-				catalina ? allocChecksCatalina : allocChecks, 0x100, "allocateHWEngines") && !catalina) {
-			route("__ZN26AMDRadeonX4000_AMDHardware14startHWEnginesEv",
+		bool allocOk = route("__ZN32AMDRadeonX4000_AMDBaffinHardware17allocateHWEnginesEv",
+			reinterpret_cast<mach_vm_address_t>(wrapAllocateHWEngines), orgAllocateHWEngines,
+			catalina ? allocChecksCatalina : allocChecks, 0x100, "allocateHWEngines");
+		bool startOk = catalina;
+		if (allocOk && !catalina) {
+			startOk = route("__ZN26AMDRadeonX4000_AMDHardware14startHWEnginesEv",
 				reinterpret_cast<mach_vm_address_t>(wrapStartHWEngines), orgStartHWEngines,
 				bigSur ? startChecksBigSur : startChecks, 0xA0,
 				"startHWEngines");
@@ -5674,10 +5692,16 @@ void CRDriver::patchAccelerator(KernelPatcher &patcher, size_t index, mach_vm_ad
 			catalina ? powerUpChecksCatalina : powerUpChecks, 0x30, "powerUpHWEngines");
 		static const char *const channelChecks[] {"488bbcc7b0030000", "488b80a0010000", nullptr};
 		static const char *const channelChecksCatalina[] {"488bbcc740030000", "488b80a0010000", nullptr};
-		route("__ZN26AMDRadeonX4000_AMDHardware12getHWChannelE20_eAMD_HW_ENGINE_TYPE18_eAMD_HW_RING_TYPE",
+		bool channelOk = route("__ZN26AMDRadeonX4000_AMDHardware12getHWChannelE20_eAMD_HW_ENGINE_TYPE18_eAMD_HW_RING_TYPE",
 			reinterpret_cast<mach_vm_address_t>(wrapGetHWChannel), orgGetHWChannel,
 			catalina ? channelChecksCatalina : channelChecks, 0x26,
 			"getHWChannel");
+		// Stoney has one sDMA engine: without these three Apple's VM manager gets no sDMA channel and the first
+		// page-table update panics (issue #4, kernel 20.1: all three "nomatch").
+		if (!allocOk || !startOk || !channelOk)
+			accelUnsafeWhy = !allocOk ? "Stoney sDMA fix: allocateHWEngines unknown on this macOS build" :
+				!startOk ? "Stoney sDMA fix: startHWEngines unknown on this macOS build" :
+				"Stoney sDMA fix: getHWChannel unknown on this macOS build";
 	}
 	// Carrizo (A8-7680, 2026-11-21): the powerUpHWEngines route above is Stoney-only (its sDMA fix), so with -crvideo
 	// the SMU never powered UVD/VCE (smuVideoPowerOn runs in the wrapper) and every session was refused ("video not
