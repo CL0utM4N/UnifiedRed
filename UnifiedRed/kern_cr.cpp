@@ -5536,6 +5536,29 @@ static uint64_t wrapEndVMPTUpdate(void *that) {
 	channel = *reinterpret_cast<void **>(self + 0x28);
 	return vfunc<uint64_t (*)(void *, uint32_t)>(channel, 0x160)(channel, 0);
 }
+// Issue #4 on Ventura 13.7.8 (A9-9420e, 80 MB carve-out): every Stoney fix applied, yet the VM manager's sDMA channel
+// (+0x28) was still null at the first page-table update. Only AMDHWVMM::setMemoryAllocationsEnabled(true) fills it
+// (+0x28 = the accelerator's channel, +0x30 its DMA HW channel), and setVirtualSpaceReady(true) reserves 0x4400000
+// bytes (+0x48 = base, 0 if the reservation failed). Record both for the panic report.
+static mach_vm_address_t orgVmmSpaceReady, orgVmmAllocEnabled;
+static uint32_t vmmSpaceReadyOn, vmmSpaceReadyOff, vmmAllocOn, vmmAllocOff;
+static uint64_t vmmBaseAfter;
+static void *vmmChannelAfter;
+
+static void wrapVmmSpaceReady(void *that, bool on) {
+	FunctionCast(wrapVmmSpaceReady, orgVmmSpaceReady)(that, on);
+	(on ? vmmSpaceReadyOn : vmmSpaceReadyOff)++;
+	vmmBaseAfter = *reinterpret_cast<uint64_t *>(static_cast<uint8_t *>(that) + 0x48);
+	traceNote("vmm.spaceReady(%u)=%llx ", on, vmmBaseAfter);
+}
+
+static void wrapVmmAllocEnabled(void *that, bool on) {
+	FunctionCast(wrapVmmAllocEnabled, orgVmmAllocEnabled)(that, on);
+	(on ? vmmAllocOn : vmmAllocOff)++;
+	vmmChannelAfter = *reinterpret_cast<void **>(static_cast<uint8_t *>(that) + 0x28);
+	traceNote("vmm.allocEnabled(%u)=%p ", on, vmmChannelAfter);
+}
+
 static bool wrapPowerUpHWEngines(void *that);
 static bool powerUpKeepMm;  // Carrizo: the wrapper powers video up but leaves Apple's UVD/VCE/SAMU power-ups alone
 
@@ -5845,6 +5868,11 @@ void CRDriver::patchAccelerator(KernelPatcher &patcher, size_t index, mach_vm_ad
 			patcher.clearError();
 		}
 	}
+	route("__ZN23AMDRadeonX4000_AMDHWVMM20setVirtualSpaceReadyEb", reinterpret_cast<mach_vm_address_t>(wrapVmmSpaceReady),
+		orgVmmSpaceReady, nullptr, 0, "vmm setVirtualSpaceReady");
+	route("__ZN23AMDRadeonX4000_AMDHWVMM27setMemoryAllocationsEnabledEb",
+		reinterpret_cast<mach_vm_address_t>(wrapVmmAllocEnabled), orgVmmAllocEnabled, nullptr, 0,
+		"vmm setMemoryAllocationsEnabled");
 	vmFixOn = !checkKernelArgument("-crnovmfix");
 	if (vmFixOn) {
 		route("__ZN29AMDRadeonX4000_AMDHWVMContext36updateContiguousPTEsWithDMAUsingAddrEyyyyy",
@@ -14826,14 +14854,19 @@ static void captureUserIbs(char *out, size_t size) {
 // setCrtcToPixelClock, framebuffer calls). Register values are read fresh (pipes only when powered).
 void CRDriver::vmmPanic(void *vmm) {
 	// The state that decides this first (the panic log keeps the start): the fixes the sDMA channel depends on.
-	char reason[480];
+	char reason[720];
+	auto *v = static_cast<uint8_t *>(vmm);
 	snprintf(reason, sizeof(reason), "UnifiedRed: the GPU VM manager %p has no sDMA channel (+0x28 null) at a page-table "
 		"update; Apple's endVMPTUpdate would fault. hwsig %u found/%u missed, smu load %s (calls %u), sDMA1 dropped %u "
 		"aliased %u, sDMA0-only starts %u, accel guards failed %u (last %s), routes ok %u failed %u unverified %u (last %s), "
-		"kernel %d.%d.", vmm, hwsigResolved, hwsigMissed, smuLoad.result ? smuLoad.result : "not run", smuLoadCalls,
+		"kernel %d.%d. VMM: setVirtualSpaceReady on/off %u/%u (base after %llx), setMemoryAllocationsEnabled on/off %u/%u "
+		"(channel after %p); now +0x20 %p +0x30 %p +0x48 %llx.", vmm, hwsigResolved, hwsigMissed,
+		smuLoad.result ? smuLoad.result : "not run", smuLoadCalls,
 		accelSdma1Dropped, accelSdma1Aliased, accelStartPatched, accelGuardMisses,
 		accelGuardMissLast ? accelGuardMissLast : "-", routesOk, routesFailed, routesUnverified,
-		routeLastFailed ? routeLastFailed : "-", getKernelVersion(), getKernelMinorVersion());
+		routeLastFailed ? routeLastFailed : "-", getKernelVersion(), getKernelMinorVersion(), vmmSpaceReadyOn,
+		vmmSpaceReadyOff, vmmBaseAfter, vmmAllocOn, vmmAllocOff, vmmChannelAfter, *reinterpret_cast<void **>(v + 0x20),
+		*reinterpret_cast<void **>(v + 0x30), *reinterpret_cast<uint64_t *>(v + 0x48));
 	// No disk log here: this runs in WindowServer's submission path with the accelerator's locks held.
 	panic("%s\n%s", reason, callback->composeReport(static_cast<uint32_t>(uptimeMs() / 1000), ""));
 }
