@@ -5559,6 +5559,51 @@ static void wrapVmmAllocEnabled(void *that, bool on) {
 	traceNote("vmm.allocEnabled(%u)=%p ", on, vmmChannelAfter);
 }
 
+// The next 13.7.8 panic said neither ran with "on" (setVirtualSpaceReady 0/0, setMemoryAllocationsEnabled 0/1). On
+// Ventura both come from AMDGraphicsAccelerator::powerUpHW: AMDHWMemory::setVirtualSpace(BAR0) -> AMDHardware::
+// setVirtualSpaceReady(true) -> the VMM's, then the hardware power-up, then reserveNDRVSpace (the framebuffer plus
+// 0xa000000 more of GPU memory) and only then setMemoryAllocationsEnabled(true). Any failure skips the rest. Record
+// each step so the panic names the one that failed.
+static mach_vm_address_t orgPowerUpHW, orgReserveNDRV, orgHwMemSetVirtualSpace, orgHwSpaceReady;
+static uint32_t powerUpHWCalls, powerUpHWOk, reserveNDRVCalls, reserveNDRVOk, hwMemSetVSCalls, hwSpaceReadyOn;
+static uint64_t powerUpHWLastMs, hwMemSetVSLength;
+static void *hwSpaceReadyVmm;
+
+static bool wrapPowerUpHW(void *that) {
+	bool ok = FunctionCast(wrapPowerUpHW, orgPowerUpHW)(that);
+	powerUpHWCalls++;
+	if (ok)
+		powerUpHWOk++;
+	powerUpHWLastMs = uptimeMs();
+	traceNote("accel.powerUpHW=%u ", ok);
+	return ok;
+}
+
+static bool wrapReserveNDRV(void *that) {
+	bool ok = FunctionCast(wrapReserveNDRV, orgReserveNDRV)(that);
+	reserveNDRVCalls++;
+	if (ok)
+		reserveNDRVOk++;
+	traceNote("accel.reserveNDRVSpace=%u ", ok);
+	return ok;
+}
+
+static void wrapHwMemSetVirtualSpace(void *that, IOMemoryDescriptor *desc) {
+	hwMemSetVSCalls++;
+	hwMemSetVSLength = desc ? desc->getLength() : 0;
+	traceNote("mem.setVirtualSpace(%llx) ", hwMemSetVSLength);
+	FunctionCast(wrapHwMemSetVirtualSpace, orgHwMemSetVirtualSpace)(that, desc);
+}
+
+static void wrapHwSpaceReady(void *that, bool on) {
+	if (on)
+		hwSpaceReadyOn++;
+	// AMDHardware+0x380 is the VMM it forwards to (null skips it), on Ventura 13.7.7.
+	hwSpaceReadyVmm = *reinterpret_cast<void **>(static_cast<uint8_t *>(that) + 0x380);
+	traceNote("hw.spaceReady(%u) vmm %p ", on, hwSpaceReadyVmm);
+	FunctionCast(wrapHwSpaceReady, orgHwSpaceReady)(that, on);
+}
+
 static bool wrapPowerUpHWEngines(void *that);
 static bool powerUpKeepMm;  // Carrizo: the wrapper powers video up but leaves Apple's UVD/VCE/SAMU power-ups alone
 
@@ -5873,6 +5918,17 @@ void CRDriver::patchAccelerator(KernelPatcher &patcher, size_t index, mach_vm_ad
 	route("__ZN23AMDRadeonX4000_AMDHWVMM27setMemoryAllocationsEnabledEb",
 		reinterpret_cast<mach_vm_address_t>(wrapVmmAllocEnabled), orgVmmAllocEnabled, nullptr, 0,
 		"vmm setMemoryAllocationsEnabled");
+	route("__ZN37AMDRadeonX4000_AMDGraphicsAccelerator9powerUpHWEv", reinterpret_cast<mach_vm_address_t>(wrapPowerUpHW),
+		orgPowerUpHW, nullptr, 0, "accel powerUpHW");
+	route("__ZN37AMDRadeonX4000_AMDGraphicsAccelerator16reserveNDRVSpaceEv",
+		reinterpret_cast<mach_vm_address_t>(wrapReserveNDRV), orgReserveNDRV, nullptr, 0, "accel reserveNDRVSpace");
+	route("__ZN26AMDRadeonX4000_AMDHWMemory15setVirtualSpaceEP18IOMemoryDescriptor",
+		reinterpret_cast<mach_vm_address_t>(wrapHwMemSetVirtualSpace), orgHwMemSetVirtualSpace, nullptr, 0,
+		"hwmemory setVirtualSpace");
+	if (getKernelVersion() == KernelVersion::Ventura)  // the +0x380 read is checked on 13.7.7 only
+		route("__ZN26AMDRadeonX4000_AMDHardware20setVirtualSpaceReadyEb",
+			reinterpret_cast<mach_vm_address_t>(wrapHwSpaceReady), orgHwSpaceReady, nullptr, 0,
+			"hw setVirtualSpaceReady");
 	vmFixOn = !checkKernelArgument("-crnovmfix");
 	if (vmFixOn) {
 		route("__ZN29AMDRadeonX4000_AMDHWVMContext36updateContiguousPTEsWithDMAUsingAddrEyyyyy",
@@ -14854,7 +14910,7 @@ static void captureUserIbs(char *out, size_t size) {
 // setCrtcToPixelClock, framebuffer calls). Register values are read fresh (pipes only when powered).
 void CRDriver::vmmPanic(void *vmm) {
 	// The state that decides this first (the panic log keeps the start): the fixes the sDMA channel depends on.
-	char reason[720];
+	char reason[1024];
 	auto *v = static_cast<uint8_t *>(vmm);
 	snprintf(reason, sizeof(reason), "UnifiedRed: the GPU VM manager %p has no sDMA channel (+0x28 null) at a page-table "
 		"update; Apple's endVMPTUpdate would fault. hwsig %u found/%u missed, smu load %s (calls %u), sDMA1 dropped %u "
@@ -14867,6 +14923,12 @@ void CRDriver::vmmPanic(void *vmm) {
 		routeLastFailed ? routeLastFailed : "-", getKernelVersion(), getKernelMinorVersion(), vmmSpaceReadyOn,
 		vmmSpaceReadyOff, vmmBaseAfter, vmmAllocOn, vmmAllocOff, vmmChannelAfter, *reinterpret_cast<void **>(v + 0x20),
 		*reinterpret_cast<void **>(v + 0x30), *reinterpret_cast<uint64_t *>(v + 0x48));
+	size_t used = strlen(reason);
+	snprintf(reason + used, sizeof(reason) - used, " Setup: powerUpHW %u calls %u ok (last @%llu ms), "
+		"reserveNDRVSpace %u calls %u ok, AMDHWMemory::setVirtualSpace %u calls (length %llx), "
+		"AMDHardware::setVirtualSpaceReady on %u (vmm %p); panic @%llu ms.", powerUpHWCalls, powerUpHWOk,
+		powerUpHWLastMs, reserveNDRVCalls, reserveNDRVOk, hwMemSetVSCalls, hwMemSetVSLength, hwSpaceReadyOn,
+		hwSpaceReadyVmm, uptimeMs());
 	// No disk log here: this runs in WindowServer's submission path with the accelerator's locks held.
 	panic("%s\n%s", reason, callback->composeReport(static_cast<uint32_t>(uptimeMs() / 1000), ""));
 }
