@@ -12010,6 +12010,15 @@ static void uvdFrameCheck(uint32_t vmid, uint64_t msgVa) {
 			pte(j.bs, 3), pte(j.bs, 16), pte(j.bs, 17), j.dt, pte(j.dt, 0), pte(j.dt, 1), pte(j.dt, 2), pte(j.dt, 3),
 			pte(j.dt, 16), pte(j.dt, 17), vceBridge.refreshChecks, vceBridge.refreshed);
 	}
+	// The whole UVD register block (dwords 0x3B00-0x3DFF) mid-decode, once per session: the same range
+	// scripts/linux_uvd_dump.py reads on Linux while Mesa decodes, to diff the set-up.
+	if (j.seq == 10 && gpuMmio)
+		for (uint32_t base = 0x3B00; base <= 0x3DFF; base += 16) {
+			auto *m = gpuMmio;
+			diskLogEvent("uvd regdump %04x: %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x",
+				base, m[base], m[base + 1], m[base + 2], m[base + 3], m[base + 4], m[base + 5], m[base + 6], m[base + 7],
+				m[base + 8], m[base + 9], m[base + 10], m[base + 11], m[base + 12], m[base + 13], m[base + 14], m[base + 15]);
+		}
 	uint32_t last;
 	if (j.pitch && j.h && j.h <= 2304) {
 		uvdRows(vmid, j.dt + j.lumaTop, j.pitch, j.h, true, last);
