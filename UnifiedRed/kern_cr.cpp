@@ -12395,6 +12395,22 @@ static void uvdBridgeRing(void *that) {
 	for (uint32_t n = 0; pos != tail && n < 0x4000; n += 2) {
 		uint32_t at = pos, next = (pos + 1) % size;
 		uint32_t reg = ring[at], value = ring[next];
+		// Stoney's firmware speaks Linux's ring protocol (uvd_v6_0_ring_emit_fence: GPCOM CMD 0 writes the fence, CMD 2
+		// traps). Apple's Polaris frame writes the fence with CMD 0x80000000 and also writes 3 to 0x3D7F, which Linux
+		// never touches. With Stoney's firmware swapped in: CMD 0x80000000 -> 0, the 0x3D7F write -> NO_OP.
+		if (uvdFwSwapped && !checkKernelArgument("-crnouvdlinuxring")) {
+			static uint32_t ringFixLogs;
+			if (reg == 0x3BC3 && value == 0x80000000) {
+				ring[next] = 0;
+				if (ringFixLogs++ < 2)
+					diskLogEvent("uvd ring: fence command 80000000 -> 0 (Linux's) for Stoney's firmware");
+			} else if (reg == 0x3D7F) {
+				ring[at] = 0x3BFF;
+				ring[next] = 0;
+				if (ringFixLogs++ < 2)
+					diskLogEvent("uvd ring: write of %x to 3d7f -> NO_OP for Stoney's firmware", value);
+			}
+		}
 		if (reg == 0x3DA1)
 			vmidAt = next;
 		else if (reg == 0x3C66)
