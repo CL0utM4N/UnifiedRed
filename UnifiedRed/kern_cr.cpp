@@ -7005,6 +7005,73 @@ static void uvdSwapFirmware(void *engine) {
 		version & 0xFF, ucodeSize, appleImage, Window0End, apple[0], apple[1], apple[2], apple[3], apple[4], apple[5]);
 }
 
+// With Stoney's firmware, Apple's start (written for Polaris's UVD 6.3) leaves the firmware alive but uninitialised
+// (af90a20 Big Sur log 1795499179: STATUS 10002, yet 0x3C00 / 0x3BE1 / 0x3BE3 stay 0, which Linux's and Apple's
+// firmware set at boot; no job ever runs). After Apple's start has set the cache windows and its ring, redo the VCPU
+// bring-up exactly as Linux's uvd_v6_0_start does, keeping Apple's ring base, size and pointers. -crnouvdlinuxstart
+// skips it.
+static struct {
+	uint32_t runs, tries, status, rptr, wptr;
+} uvdLinuxStart;
+
+static bool uvdLinuxRestart() {
+	auto *m = gpuMmio;
+	auto &s = uvdLinuxStart;
+	s.runs++;
+	uint32_t rbCntl = m[0x3DA9], rptrAddr = m[0x3DAA], rbLo = m[0x3C69], rbHi = m[0x3C68];
+	s.rptr = m[0x3DA4];
+	s.wptr = m[0x3DA5];
+	m[0x38C4] &= ~0x4U;                       // UVD_POWER_STATUS: disable DPG
+	m[0x3D40] &= ~0x2U;                       // MASTINT_EN.VCPU_EN = 0
+	m[0x3D3D] |= 0x100;                       // LMI_CTRL2.STALL_ARB_UMC = 1
+	IODelay(1000);
+	m[0x3DA0] = 0x20EF;                       // LMI, VCPU, LBSI, RBC, CSM, CXW, TAP, LMI_UMC into reset
+	IODelay(5000);
+	m[0x398] &= ~0x40000U;                    // SRBM_SOFT_RESET.SOFT_RESET_UVD = 0
+	IODelay(5000);
+	m[0x3D66] = 0x302340;                     // LMI_CTRL
+	m[0x3D6D] = 0;                            // LMI_SWAP_CNTL
+	m[0x3D6F] = 0;                            // MP_SWAP_CNTL
+	m[0x3D79] = 0x40C2040;                    // MPC_SET_MUXA0
+	m[0x3D7A] = 0;
+	m[0x3D7B] = 0x40C2040;                    // MPC_SET_MUXB0
+	m[0x3D7C] = 0;
+	m[0x3D7E] = 0;                            // MPC_SET_ALU
+	m[0x3D7D] = 0x88;                         // MPC_SET_MUX
+	m[0x3DA0] = 0x8;                          // everything out of reset but the VCPU
+	IODelay(5000);
+	m[0x3D98] = 0x200;                        // VCPU_CNTL = CLK_EN
+	m[0x3D3D] &= ~0x100U;                     // enable UMC
+	m[0x3DA0] = 0;                            // boot the VCPU
+	IODelay(10000);
+	uint32_t status = 0;
+	for (s.tries = 0; s.tries < 10; s.tries++) {
+		for (uint32_t j = 0; j < 100 && !((status = m[0x3DAF]) & 2); j++)
+			IODelay(10000);
+		if (status & 2)
+			break;
+		m[0x3DA0] |= 0x8;
+		IODelay(10000);
+		m[0x3DA0] &= ~0x8U;
+		IODelay(10000);
+	}
+	s.status = status;
+	if (!(status & 2))
+		return false;
+	m[0x3D40] = (m[0x3D40] & ~0x6U) | 0x6;   // MASTINT_EN: VCPU_EN | SYS_EN
+	m[0x3DAF] &= ~(2U << 1);                  // clear UVD_STATUS bit 2
+	// Apple's ring, forced idle and set up again as Linux does.
+	m[0x3DA9] = rbCntl | 0x10000;             // RB_NO_FETCH
+	m[0x3DA6] = 0;                            // RB_WPTR_CNTL
+	m[0x3DAA] = rptrAddr;
+	m[0x3C69] = rbLo;
+	m[0x3C68] = rbHi;
+	m[0x3DA4] = s.wptr;
+	m[0x3DA5] = s.wptr;
+	m[0x3DA9] = rbCntl & ~0x10000U;
+	return true;
+}
+
 static bool wrapUvdStart(void *that) {
 	auto &info = uvdStartInfo;
 	info.calls++;
@@ -7019,6 +7086,14 @@ static bool wrapUvdStart(void *that) {
 	bool ret = FunctionCast(wrapUvdStart, orgUvdStart)(that);
 	if (!gpuMmio)
 		return ret;
+	if (ret && uvdFwSwapped && !checkKernelArgument("-crnouvdlinuxstart")) {
+		bool ok = uvdLinuxRestart();
+		auto &s = uvdLinuxStart;
+		diskLogEvent("uvd linux start #%u: %s after %u retries, status %x; ring rptr/wptr %x/%x kept; 3c00 %x 3be1 %x 3be3 %x "
+			"vcpu %x mastint %x", s.runs, ok ? "VCPU up" : "VCPU NOT responding", s.tries, s.status, s.rptr, s.wptr,
+			gpuMmio[0x3C00], gpuMmio[0x3BE1], gpuMmio[0x3BE3], gpuMmio[0x3D98], gpuMmio[0x3D40]);
+		ret = ok;
+	}
 	uint32_t status = gpuMmio[0x3DAF];
 	for (uint32_t i = 0; i < 100 && ret && !(status & 2); i++) {
 		IODelay(1000);
