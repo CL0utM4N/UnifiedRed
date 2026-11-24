@@ -36,7 +36,7 @@ scales with load (400 MHz idle, up to the chip's top level).
 | External displays (HDMI) | **Works** on the D509BA and the Dell Inspiron 3475 (Tahoe): the monitor is detected and lit at boot and on hot-plug (1920×1080 at 60 Hz tested), and unplugging it hands the desktop back to the panel. See *HDMI* below. DisplayPort outputs untested |
 | HDMI audio | Not done |
 | Video decode/encode (UVD/VCE) | **On hold**: video plays and records in software. UVD powers up and Apple's firmware boots on it, but decoding hangs the GPU: Apple's driver gives UVD GPU virtual addresses, and Stoney's UVD has no VM support (Linux runs it in physical mode and rewrites every buffer address). Making it work means doing that translation in UnifiedRed. Findings and next steps in [docs/VIDEO.md](docs/VIDEO.md) |
-| Carrizo / Bristol Ridge | Same display engine and code paths; the SMU microcode loader, clock scaling and shader-engine fix include Carrizo's differences (second SDMA engine, second MEC), following Linux. **Untested** (no hardware): reports from owners are very welcome |
+| Carrizo / Bristol Ridge | Same display engine and code paths; the SMU microcode loader, clock scaling and shader-engine fix include Carrizo's differences (second SDMA engine, second MEC), following Linux. **Works on Bristol Ridge** (A10-9600P, Sequoia 15.8.3, from a user report: Metal acceleration, with minor icon glitches); more reports are welcome |
 
 **Tested on:**
 
@@ -47,6 +47,7 @@ scales with load (400 MHz idle, up to the chip's top level).
 | Acer Aspire E5-523 ([Lost-Entrepreneur439](https://www.reddit.com/r/hackintosh/comments/1xh74lv/ive_done_a_lot_of_hackintoshes_but_this_might_be/)) | E2-9010 (Stoney Ridge, Radeon R2) | Ventura 13.7.8 | Display and Metal acceleration work |
 | HP 17-ak0xx ([u/macos12345](https://www.reddit.com/r/hackintosh/comments/1xhaqvw/finally_macos_is_possible_on_pre_ryzen_apus/)) | A6-9220 (Stoney Ridge, Radeon R4) | Ventura | Display and Metal acceleration work |
 | ASUS X555B ([u/Azusawaga](https://www.reddit.com/r/hackintosh/comments/1xb8mct/what_used_to_be_impossible_today_is_the_reality/)) | A9-9410 (Stoney Ridge, Radeon R5) | Sequoia 15.8.1 | Display and Metal acceleration work |
+| A10-9600P laptop ([u/MangoProMax](https://www.reddit.com/r/hackintosh/comments/1xvfyk1/unifiedred_on_amd_a109600p_bristol_ridge_and/)) | A10-9600P (Bristol Ridge, Radeon R5; R7 M440 dGPU disabled) | Sequoia 15.8.3 | Display and Metal acceleration work, minor icon glitches; brightness not working yet |
 
 **macOS versions:**
 
