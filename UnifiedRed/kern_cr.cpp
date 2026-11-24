@@ -12267,7 +12267,14 @@ static void uvdBridgeRing(void *that) {
 				m[0x3D6F], m[0x3D79], m[0x3D7A], m[0x3D7B], m[0x3D7C], m[0x3D7D], m[0x3D7E], m[0x3D3D], m[0x3D40], m[0x3D2C],
 				m[0x3D2A], m[0x3BE6], m[0x3BE4]);
 		}
-		if (!checkKernelArgument("-crnouvdlinuxregs")) {
+		// Once per UVD start, not before every submit: Linux writes these once in uvd_v6_0_start and the firmware then
+		// reprograms some itself. Linux mid-decode (scripts/linux_uvd_dump.py, D509BA 2026-11-24): MUXA0 0x1c6144, ALU 1,
+		// LMI_CTRL 0x3d2340 (CRC_SEL set). Rewriting the start values before each job undid that every frame.
+		// -cruvdregsevery restores the old per-submit behaviour.
+		static uint32_t regsForStart = ~0U;
+		bool regsDue = regsForStart != uvdStartInfo.calls || checkKernelArgument("-cruvdregsevery");
+		if (regsDue && !checkKernelArgument("-crnouvdlinuxregs")) {
+			regsForStart = uvdStartInfo.calls;
 			static uint32_t regFixes;
 			uint32_t changed = 0;
 			for (auto &r : linuxRegs)
