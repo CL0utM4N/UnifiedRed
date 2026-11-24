@@ -12270,6 +12270,23 @@ static void uvdBridgeRing(void *that) {
 				diskLogEvent("uvd regs: %u set to Linux's values; now LMI_CTRL %x MUXA0 %x MUXB0 %x MUX %x", changed, m[0x3D66],
 					m[0x3D79], m[0x3D7B], m[0x3D7D]);
 		}
+		// D509BA log 1795491459: UVD got through about one job a second (ring rptr far behind wptr) and about half the jobs
+		// wrote nothing. Apple leaves UVD's clock gating on (CGC_CTRL 0x105: dynamic mode; CGC_GATE 0x33f786, SUVD_CGC_GATE
+		// 0x3fff: sub-block gates); Linux's uvd_v6_0_start turns dynamic mode off ("disable clock gating") before the
+		// firmware runs. Opt-in experiment -cruvdnocg: no dynamic mode, no gates, before each submit.
+		if (checkKernelArgument("-cruvdnocg")) {
+			static uint32_t cgLogs;
+			uint32_t ctrl = m[0x3D2C], gate = m[0x3D2A], suvdCtrl = m[0x3BE6], suvdGate = m[0x3BE4];
+			if ((ctrl & 1) || gate || suvdCtrl || suvdGate) {
+				m[0x3D2C] = ctrl & ~1U;
+				m[0x3D2A] = 0;
+				m[0x3BE6] = 0;
+				m[0x3BE4] = 0;
+				if (cgLogs++ < 4)
+					diskLogEvent("uvd clock gating off: CGC_CTRL %x -> %x, CGC_GATE %x -> %x, SUVD_CGC_CTRL %x -> %x, "
+						"SUVD_CGC_GATE %x -> %x", ctrl, m[0x3D2C], gate, m[0x3D2A], suvdCtrl, m[0x3BE6], suvdGate, m[0x3BE4]);
+			}
+		}
 	}
 	if (!checkKernelArgument("-crnouvdaddrcfg")) {
 		auto *m = gpuMmio;
