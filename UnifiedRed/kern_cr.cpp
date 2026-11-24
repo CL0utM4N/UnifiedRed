@@ -12125,8 +12125,11 @@ static bool uvdBridgeIb(uint32_t vmid, uint64_t ibVa, uint32_t len, uint64_t &ib
 								field, rd(0), rd(0xCE0 / 4), rd(0xCE0 / 4 + 1), rd(0xCE0 / 4 + 2), rd(0xCE0 / 4 + 3));
 						// The codec section (Mesa ruvd_h264 from dword 56: profile, level, sps/pps flags, the byte fields,
 						// then the scaling lists), to compare with what Mesa fills in for the same stream.
+						// Up to dword 336 (since 7692545): the whole H.264 section (scaling lists, frame_num and POC lists,
+						// decoded_pic_idx, ref_frame_list) and what follows, to rebuild Mesa's message from the stream's
+						// SPS/PPS and diff it field by field.
 						if (msgFixLogs <= 2)
-							for (uint32_t base = 36; base < 76; base += 20)
+							for (uint32_t base = 0; base < 336; base += 20)
 								diskLogEvent("uvd msg dwords %u..%u: %x %x %x %x %x %x %x %x %x %x %x %x %x %x %x %x %x %x %x %x",
 									base, base + 19, rd(base), rd(base + 1), rd(base + 2), rd(base + 3), rd(base + 4),
 									rd(base + 5), rd(base + 6), rd(base + 7), rd(base + 8), rd(base + 9), rd(base + 10),
