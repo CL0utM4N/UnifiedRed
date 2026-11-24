@@ -12329,11 +12329,18 @@ static void uvdBridgeRing(void *that) {
 			regsForStart = uvdStartInfo.calls;
 			static uint32_t regFixes;
 			uint32_t changed = 0;
-			for (auto &r : linuxRegs)
-				if (m[r.reg] != r.value) {
-					m[r.reg] = r.value;
+			for (auto &r : linuxRegs) {
+				// cf0e01f log 1795498013: with Stoney's firmware swapped in, the decoder never started (no feedback, the
+				// decode-block registers all 0) though the firmware consumed the ring. Apple's CAIL sets up firmware
+				// validation for Apple's image (CailUvdSetupCacheWindowsAndFwv), which Stoney's image can't pass, and
+				// Linux's LMI_CTRL has DISABLE_ON_FWV_FAIL (bit 20), Apple's (0x203108) doesn't; Linux never sets up the
+				// validation. The pre-LMI-fix Stoney test (d219732) did decode. So leave that bit off for Stoney's firmware.
+				uint32_t value = r.reg == 0x3D66 && uvdFwSwapped ? r.value & ~0x100000U : r.value;
+				if (m[r.reg] != value) {
+					m[r.reg] = value;
 					changed++;
 				}
+			}
 			if (changed && regFixes++ < 4)
 				diskLogEvent("uvd regs: %u set to Linux's values; now LMI_CTRL %x MUXA0 %x MUXB0 %x MUX %x", changed, m[0x3D66],
 					m[0x3D79], m[0x3D7B], m[0x3D7D]);
