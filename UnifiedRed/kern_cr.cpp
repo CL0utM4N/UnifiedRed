@@ -11892,7 +11892,10 @@ static uint8_t *uvdVaPtr(uint32_t vmid, uint64_t va, uint32_t bytes) {
 	return physmapPtr(phys, bytes);
 }
 
-// Rows of the plane at va (pitch bytes apart) whose first 16 bytes are non-zero (or, clear: zero them).
+// Rows of the plane at va (pitch bytes apart) whose first 16 bytes the decoder overwrote (or, clear: fill them with a
+// sentinel). Zero was the marker until 963d4fc, but decoded black (full-range luma 0) reads as zero too: D509BA log
+// 1795491459 had P frames with every chroma row written and "no" luma rows, a screen recording with a dark left edge.
+static constexpr uint32_t UvdRowSentinel = 0xA55AA55A;
 static uint32_t uvdRows(uint32_t vmid, uint64_t va, uint32_t pitch, uint32_t rows, bool clear, uint32_t &last) {
 	uint32_t n = 0;
 	last = 0;
@@ -11901,11 +11904,11 @@ static uint32_t uvdRows(uint32_t vmid, uint64_t va, uint32_t pitch, uint32_t row
 		if (!p)
 			continue;
 		if (clear) {
-			p[0] = p[1] = p[2] = p[3] = 0;
+			p[0] = p[1] = p[2] = p[3] = UvdRowSentinel;
 			flushLines(const_cast<const uint8_t *>(reinterpret_cast<volatile uint8_t *>(p)), 16);
 		} else {
 			flushLines(const_cast<const uint8_t *>(reinterpret_cast<volatile uint8_t *>(p)), 16);
-			if (p[0] | p[1] | p[2] | p[3]) {
+			if (p[0] != UvdRowSentinel || p[1] != UvdRowSentinel || p[2] != UvdRowSentinel || p[3] != UvdRowSentinel) {
 				n++;
 				last = r;
 			}
