@@ -1665,6 +1665,8 @@ static mach_vm_address_t orgVceWriteTail, orgVceGetHead, orgRingEnable, orgRingD
 	orgVceRegLoc, orgVceLlqRegLoc, vceRingVtable, vceLlqRingVtable, orgGartInit, uvdDecRingVtable;
 static void uvdBridgeRing(void *that);
 static void vceBridgeForget();
+const uint8_t *stoneyUvdFirmware(size_t &size);  // kern_uvdfw.cpp
+static void uvdSwapFirmware(void *engine);
 static bool wrapGartInit(void *that, void *hw, void *params);
 static void wrapVceWriteTail(void *that);
 static uint32_t wrapVceGetHead(void *that);
@@ -5263,6 +5265,9 @@ namespace {
 			gcn2MmSlots(a, mmSaved, true);
 		if (!strcmp(stages[N].name, "initializeProjectDependentResources"))
 			controllerReady = true;
+		// Apple's UVD firmware is in place now, before AMDUVDHWEngine::start sets the cache windows and releases the VCPU.
+		if (ret && !strcmp(stages[N].name, "uvd.loadFW"))
+			uvdSwapFirmware(a);
 		if (gcn2Gpu && gcn2CrumbStage(stages[N].kext, stages[N].name))
 			gcn2StageCrumb(stages[N].name, true, static_cast<uint32_t>(ret));
 		traceEvent(stages[N].name, true, static_cast<uint32_t>(ret));
@@ -6956,6 +6961,50 @@ static bool uvdReadyForSession() {
 // uvd_v6_0_start waits for UVD_STATUS bit 1 (VCPU report) after releasing the VCPU. So after Apple's start, wait up to
 // 100 ms for that bit; without it fail the start, refuse sessions from then on, and fail later starts (the restart's)
 // without calling Apple's, which is what hung. The registers go into the report: a frozen boot loses its disk log.
+// Stoney's own UVD firmware (-cruvd -cruvdstoneyfw on Stoney). Restored 2026-11-24: Linux decodes on this machine
+// with Stoney's firmware 1.43 and Mesa's pre-Polaris layout (macroblock context inside the DPB, no 0x206 buffer:
+// -cruvdowndpb), the one combination never tried after the message fix (ff8b260); the d219732 / ef25f06 tests ran
+// before it. Apple's runs Polaris (UVD 6.3) firmware on Stoney's UVD 6.2. Apple's loadUVDFW copies its image (header
+// 11111111 22222222 33333333 44444444, then code from +0x100) to the start of the engine's firmware memory (+0x160 CPU
+// address, +0x128 size; 0x2c4000 on the D509BA), and its cache windows are code at 0x100 (0x80000 bytes), heap
+// 0x80100 (0x80000), stack 0x100100 (0x1a9000). Linux (amdgpu_uvd_resume) copies Stoney's microcode to the same place
+// with window 0 from +256 too, and needs less heap and stack. So copy Stoney's microcode over Apple's image and zero
+// the rest of window 0; Apple's windows stay. Only the firmware's container header (common_firmware_header) is read.
+static uint32_t uvdFwSwapped;
+
+static void uvdSwapFirmware(void *engine) {
+	if (!engine || smuCarrizo || !checkKernelArgument("-cruvd") || !checkKernelArgument("-cruvdstoneyfw"))
+		return;
+	auto *e = static_cast<uint8_t *>(engine);
+	auto *fw = *reinterpret_cast<uint8_t **>(e + 0x160);
+	uint32_t fwSize = *reinterpret_cast<uint32_t *>(e + 0x128);
+	size_t blobSize = 0;
+	auto *blob = stoneyUvdFirmware(blobSize);
+	constexpr uint32_t Window0End = 0x80100;
+	auto *apple = reinterpret_cast<const uint32_t *>(fw);
+	uint32_t ucodeSize = blobSize >= 0x20 ? *reinterpret_cast<const uint32_t *>(blob + 0x14) : 0;
+	uint32_t ucodeOff = blobSize >= 0x20 ? *reinterpret_cast<const uint32_t *>(blob + 0x18) : 0;
+	uint32_t version = blobSize >= 0x20 ? *reinterpret_cast<const uint32_t *>(blob + 0x10) : 0;
+	bool appleOk = fw && fwSize >= Window0End && apple[0] == 0x11111111 && apple[1] == 0x22222222 &&
+		apple[2] == 0x33333333 && apple[3] == 0x44444444;
+	bool blobOk = ucodeSize > 0x200 && ucodeOff >= 0x20 && ucodeOff + static_cast<size_t>(ucodeSize) <= blobSize &&
+		ucodeSize + 8 <= Window0End;
+	if (!appleOk || !blobOk) {
+		diskLogEvent("uvd fw: Stoney firmware not loaded (Apple image %s, memory %x; blob %zu bytes, microcode %x at %x)",
+			appleOk ? "ok" : "not as expected", fwSize, blobSize, ucodeSize, ucodeOff);
+		return;
+	}
+	uint32_t appleImage = apple[5];
+	memcpy(fw, blob + ucodeOff, ucodeSize);
+	memset(fw + ucodeSize, 0, Window0End - ucodeSize);
+	flushLines(fw, Window0End);
+	__asm__ volatile("mfence" ::: "memory");
+	uvdFwSwapped++;
+	diskLogEvent("uvd fw: Stoney firmware %u.%u (family %u) loaded over Apple's: microcode %x bytes (Apple's image %x), "
+		"window 0 zeroed to %x; header now %x %x %x %x %x %x", (version >> 24) & 0xFF, (version >> 8) & 0xFF,
+		version & 0xFF, ucodeSize, appleImage, Window0End, apple[0], apple[1], apple[2], apple[3], apple[4], apple[5]);
+}
+
 static bool wrapUvdStart(void *that) {
 	auto &info = uvdStartInfo;
 	info.calls++;
