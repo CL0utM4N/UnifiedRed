@@ -12286,6 +12286,19 @@ static void uvdBridgeRing(void *that) {
 				diskLogEvent("uvd regs: %u set to Linux's values; now LMI_CTRL %x MUXA0 %x MUXB0 %x MUX %x", changed, m[0x3D66],
 					m[0x3D79], m[0x3D7B], m[0x3D7D]);
 		}
+		// Linux vs Apple mid-decode (uvd-linux-dump.txt vs log 1795495506): UVD_VCPU_CNTL is 0x80200 (CLK_EN, SUVD_EN) on
+		// Linux, 0xff80200 here: Apple's CAIL also sets PRB_TIMEOUT_VAL (bits 20-27) to 0xff, which Linux leaves 0. A
+		// VCPU timeout fits jobs taking ~1 s, frames cut off part-way and jobs that write nothing. Clear it before each
+		// submit (Apple may set it again); -cruvdprbtimeout keeps Apple's.
+		if (!checkKernelArgument("-cruvdprbtimeout")) {
+			static uint32_t prbLogs;
+			uint32_t vcpu = m[0x3D98];
+			if (vcpu & 0xFF00000) {
+				m[0x3D98] = vcpu & ~0xFF00000U;
+				if (prbLogs++ < 4)
+					diskLogEvent("uvd vcpu cntl: %x -> %x (PRB_TIMEOUT_VAL cleared, as Linux)", vcpu, m[0x3D98]);
+			}
+		}
 		// D509BA log 1795491459: UVD got through about one job a second (ring rptr far behind wptr) and about half the jobs
 		// wrote nothing. Apple leaves UVD's clock gating on (CGC_CTRL 0x105: dynamic mode; CGC_GATE 0x33f786, SUVD_CGC_GATE
 		// 0x3fff: sub-block gates); Linux's uvd_v6_0_start turns dynamic mode off ("disable clock gating") before the
